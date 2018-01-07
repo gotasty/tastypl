@@ -53,6 +53,9 @@ type transaction struct {
 var (
 	oneHundred  = decimal.New(100, 0)
 	oneThousand = decimal.New(1000, 0)
+
+	// Cutoff point for YTD stuff.
+	ytdStart = time.Date(time.Now().Year(), 1, 1, 0, 0, 0, 0, time.Now().Location())
 )
 
 func (t *transaction) String() string {
@@ -81,6 +84,7 @@ func roundUp(d decimal.Decimal) decimal.Decimal {
 // There is a rounding error in the fees reported by the desktop app and
 // web-based account management interface.  Here we recompute the correct
 // amount and fix the transaction.
+// TODO: This computes higher fees than it should for some reason.
 func (t *transaction) fixFees() {
 	if t.txType != "Trade" {
 		return
@@ -124,6 +128,10 @@ func (t *transaction) sanityCheck() {
 	}
 }
 
+func (t *transaction) ytd() bool {
+	return t.date.After(ytdStart)
+}
+
 func loadCSV(path string) [][]string {
 	f, err := os.Open(path)
 	if err != nil {
@@ -157,6 +165,8 @@ type position struct {
 }
 
 type portfolio struct {
+	ytd bool // Only track YTD transactions
+
 	// All transactions.
 	transactions []*transaction
 
@@ -182,71 +192,32 @@ type portfolio struct {
 	assTotal decimal.Decimal
 }
 
-func NewPortfolio(records [][]string) *portfolio {
+func NewPortfolio(records [][]string, ytd bool) *portfolio {
 	p := &portfolio{
+		ytd:              ytd,
 		positions:        make(map[string]*position),
 		rplPerUnderlying: make(map[string]decimal.Decimal),
 	}
 
-	p.importTransactions(records)
-	// Normall the CSV is sorted from newest to oldest transaction but
-	// don't assume that and sort everything from oldest to newest.
-	sort.Slice(p.transactions, func(i, j int) bool {
-		return p.transactions[i].date.Before(p.transactions[j].date)
-	})
+	// The CSV is sorted from newest to oldest transaction, reverse it.
+	for i := len(records)/2 - 1; i >= 0; i-- {
+		opp := len(records) - 1 - i
+		records[i], records[opp] = records[opp], records[i]
+	}
+	p.parseTransactions(records)
 
+	var prevTime time.Time
 	for _, tx := range p.transactions {
-		p.comms = p.comms.Add(tx.commission)
-		p.fees = p.fees.Add(tx.fees)
-		switch tx.txType {
-		case "Trade":
-			switch tx.action {
-			case "SELL_TO_OPEN", "BUY_TO_OPEN":
-				p.openPosition(tx)
-			case "SELL_TO_CLOSE", "BUY_TO_CLOSE":
-				p.closePosition(tx)
-			default:
-				glog.Fatalf("Unhandled action type %q in %s", tx.action, tx)
-			}
-		case "Receive Deliver":
-			// We can't use closePosition() here because we don't know whether
-			// we're closing a long or a short position.  So the best we can
-			// do is just close all positions for this symbol.  In theory, if
-			// we held both long and short positions for the same option, that
-			// would be problematic, in practice however I don't believe that's
-			// possible on TW.
-			pos, ok := p.positions[tx.symbol]
-			if !ok {
-				glog.Fatalf("Couldn't find an opening transaction for %s", tx)
-			}
-			assigned := strings.HasSuffix(tx.description, "due to assignment")
-			if assigned {
-				p.assigned++
-				p.fees = p.fees.Add(assignmentFee)
-			}
-			quantity := tx.quantity.Abs() // clone
-			for _, open := range pos.opens {
-				glog.V(3).Infof("position %s expired by %s", open, tx)
-				quantity = quantity.Sub(open.quantity)
-				if assigned {
-					cost := open.strike.Mul(decimal.New(int64(open.multiplier), 0))
-					p.assTotal = p.assTotal.Sub(cost)
-				} else {
-					p.recordPL(open, open.value)
-				}
-			}
-			if !quantity.Equal(decimal.Zero) {
-				glog.Fatalf("Left with %d position after handling %s", quantity, tx)
-			}
-			delete(p.positions, tx.symbol)
-		default:
-			glog.Fatalf("Unhandled transaction type %q in %s", tx.txType, tx)
+		if prevTime.After(tx.date) {
+			glog.Fatalf("transaction log out of order at time %s (tx=%s)", tx.date, tx)
 		}
+		prevTime = tx.date
+		p.handleTransaction(tx)
 	}
 	return p
 }
 
-func (p *portfolio) importNonOptionTransaction(record []string) {
+func (p *portfolio) parseNonOptionTransaction(record []string) {
 	switch record[1] {
 	case "Money Movement":
 		amount := parseDecimal(record[6])
@@ -269,10 +240,27 @@ func (p *portfolio) importNonOptionTransaction(record []string) {
 	}
 }
 
-func (p *portfolio) importTransactions(records [][]string) {
+// parseTransactions parses raw transactions from the CSV and adds them to the
+// transaction history.
+func (p *portfolio) parseTransactions(records [][]string) {
 	p.transactions = make([]*transaction, len(records))
 	var j int
+	ytd := p.ytd
 	for i, rec := range records {
+		date, err := time.Parse(almostRFC3339, rec[0])
+		if err != nil {
+			glog.Fatalf("record #%d, bad transaction date: %s", i, err)
+		}
+		if ytd && date.After(ytdStart) {
+			// Reset running counts as we only want YTD numbers.
+			p.miscCash = decimal.Zero
+			p.intrs = decimal.Zero
+			p.ach = decimal.Zero
+			// Note: we don't reset p.cash as the only way to have the correct
+			// amount of cash ultimately in the account is of course to take
+			// into account (bad pun, sorry) the entire account history.
+			ytd = false // So we don't reset again.
+		}
 		value := parseDecimal(rec[6])
 		comm := parseDecimal(rec[9])
 		if comm.GreaterThan(decimal.Zero) {
@@ -289,7 +277,7 @@ func (p *portfolio) importTransactions(records [][]string) {
 		case "CALL":
 			call = true
 		case "":
-			p.importNonOptionTransaction(rec)
+			p.parseNonOptionTransaction(rec)
 			continue
 		default:
 			glog.Fatalf("record #%d, bad put/call type: %q", i, rec[15])
@@ -297,10 +285,6 @@ func (p *portfolio) importTransactions(records [][]string) {
 		mult, err := strconv.ParseUint(rec[11], 10, 16)
 		if err != nil {
 			glog.Fatalf("record #%d, bad multiplier: %s", i, err)
-		}
-		date, err := time.Parse(almostRFC3339, rec[0])
-		if err != nil {
-			glog.Fatalf("record #%d, bad transaction date: %s", i, err)
 		}
 		expDate, err := time.Parse("1/02/06", rec[13])
 		if err != nil {
@@ -347,6 +331,60 @@ func (p *portfolio) importTransactions(records [][]string) {
 	p.transactions = p.transactions[:j]
 }
 
+func (p *portfolio) handleTransaction(tx *transaction) {
+	count := !p.ytd || tx.ytd()
+	if count {
+		p.comms = p.comms.Add(tx.commission)
+		p.fees = p.fees.Add(tx.fees)
+	}
+	switch tx.txType {
+	case "Trade":
+		switch tx.action {
+		case "SELL_TO_OPEN", "BUY_TO_OPEN":
+			p.openPosition(tx)
+		case "SELL_TO_CLOSE", "BUY_TO_CLOSE":
+			p.closePosition(tx, count)
+		default:
+			glog.Fatalf("Unhandled action type %q in %s", tx.action, tx)
+		}
+	case "Receive Deliver":
+		// We can't use closePosition() here because we don't know whether
+		// we're closing a long or a short position.  So the best we can
+		// do is just close all positions for this symbol.  In theory, if
+		// we held both long and short positions for the same option, that
+		// would be problematic, in practice however I don't believe that's
+		// possible on TW.
+		pos, ok := p.positions[tx.symbol]
+		if !ok {
+			glog.Fatalf("Couldn't find an opening transaction for %s", tx)
+		}
+		assigned := strings.HasSuffix(tx.description, "due to assignment")
+		if assigned && count {
+			p.assigned++
+			p.fees = p.fees.Add(assignmentFee)
+		}
+		quantity := tx.quantity.Abs() // clone
+		for _, open := range pos.opens {
+			glog.V(3).Infof("position %s expired by %s", open, tx)
+			quantity = quantity.Sub(open.quantity)
+			if count {
+				if assigned {
+					cost := open.strike.Mul(decimal.New(int64(open.multiplier), 0))
+					p.assTotal = p.assTotal.Sub(cost)
+				} else {
+					p.recordPL(open, open.value)
+				}
+			}
+		}
+		if !quantity.Equal(decimal.Zero) {
+			glog.Fatalf("Left with %d position after handling %s", quantity, tx)
+		}
+		delete(p.positions, tx.symbol)
+	default:
+		glog.Fatalf("Unhandled transaction type %q in %s", tx.txType, tx)
+	}
+}
+
 func (p *portfolio) recordPL(tx *transaction, amount decimal.Decimal) {
 	p.rpl = p.rpl.Add(amount)
 	rpl, ok := p.rplPerUnderlying[tx.underlying]
@@ -365,7 +403,7 @@ func (p *portfolio) openPosition(tx *transaction) {
 	pos.opens = append(pos.opens, tx)
 }
 
-func (p *portfolio) closePosition(tx *transaction) {
+func (p *portfolio) closePosition(tx *transaction, count bool) {
 	// Find a matching, opposite transaction(s)
 	pos, ok := p.positions[tx.symbol]
 	if !ok {
@@ -384,7 +422,9 @@ func (p *portfolio) closePosition(tx *transaction) {
 		rpl := open.avgPrice.Add(tx.avgPrice).Mul(closed)
 		glog.V(4).Infof("%s -> %s [%s+%s] ==> realized P&L = %s",
 			open, tx, open.avgPrice, tx.avgPrice, rpl)
-		p.recordPL(tx, rpl)
+		if count {
+			p.recordPL(tx, rpl)
+		}
 		if remaining.Equal(decimal.Zero) {
 			// We closed off enough opening transactions.
 			glog.V(3).Infof("done handling %s after closing %s", tx, open)
@@ -432,10 +472,26 @@ func (p *portfolio) PrintPositions() {
 }
 
 func (p *portfolio) PrintStats() {
-	fmt.Println("----- Overall statistics ----")
+	if p.ytd {
+		fmt.Println("------- YTD statistics ------")
+	} else {
+		fmt.Println("----- Overall statistics ----")
+	}
 	const day = 24 * time.Hour
 	ntx := len(p.transactions)
-	duration := p.transactions[ntx-1].date.Sub(p.transactions[0].date).Round(day)
+	var beginTime time.Time
+	if p.ytd {
+		beginTime = ytdStart
+		for i, tx := range p.transactions {
+			if tx.ytd() { // Once we find the first YTD transaction...
+				ntx -= i // ... discount all the ones before.
+				break
+			}
+		}
+	} else {
+		beginTime = p.transactions[0].date
+	}
+	duration := p.transactions[len(p.transactions)-1].date.Sub(beginTime).Round(day)
 	days := int(duration / day)
 	pct := func(amount decimal.Decimal) string {
 		return amount.Mul(oneHundred).Div(p.rpl).StringFixed(2) + "%"
@@ -460,11 +516,14 @@ func (p *portfolio) PrintStats() {
 		}
 	}
 	fmt.Printf("Outstanding premium:    %8s\n", premium.StringFixed(2))
-	cash := grosspl.Add(premium).Add(p.ach).Add(p.assTotal).Add(p.miscCash)
 	fmt.Printf("Cash on hand:           %8s\n", p.cash.StringFixed(2))
-	if !cash.Equal(p.cash) {
-		fmt.Printf("-> Warning: estimated cash on hand should've been %s (difference: %s)\n",
-			cash.StringFixed(2), cash.Sub(p.cash).StringFixed(2))
+	if !p.ytd {
+		// Alternative method to compute cash on hand
+		cash := grosspl.Add(premium).Add(p.ach).Add(p.assTotal).Add(p.miscCash)
+		if !cash.Equal(p.cash) {
+			fmt.Printf("-> Warning: estimated cash on hand should've been %s (difference: %s)\n",
+				cash.StringFixed(2), cash.Sub(p.cash).StringFixed(2))
+		}
 	}
 }
 
@@ -485,6 +544,7 @@ func (p *portfolio) PrintPL() {
 func main() {
 	input := flag.String("input", "", "input csv file containing tastyworks transactions")
 	stats := flag.Bool("stats", true, "print overall statistics")
+	ytd := flag.Bool("ytd", false, "limit output to YTD transactions")
 	printPL := flag.Bool("printpl", false, "print realized P&L per underlying")
 	positions := flag.Bool("positions", false, "print current positions")
 	flag.Parse()
@@ -499,7 +559,7 @@ func main() {
 		glog.Fatal("CSV seems malformed")
 	}
 
-	portfolio := NewPortfolio(records[1:])
+	portfolio := NewPortfolio(records[1:], *ytd)
 	if *stats {
 		portfolio.PrintStats()
 	}

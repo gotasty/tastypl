@@ -46,6 +46,7 @@ type transaction struct {
 	underlying  string
 	expDate     time.Time
 	strike      decimal.Decimal
+	option      bool // or non-option (such as future/equity) if false
 	call        bool // or put if false
 	long        bool // or short if false
 }
@@ -103,11 +104,14 @@ func (t *transaction) fixFees() {
 }
 
 func (t *transaction) sanityCheck() {
-	if t.strike.LessThanOrEqual(decimal.Zero) {
-		glog.Fatalf("strike price can't be less than or equal to zero in %s", t)
-	}
 	if t.quantity.Sign() <= 0 {
 		glog.Fatalf("quantity is negative in %s", t)
+	}
+	if !t.option {
+		return // TODO: no other check yet for futures/equities
+	}
+	if t.strike.LessThanOrEqual(decimal.Zero) {
+		glog.Fatalf("strike price can't be less than or equal to zero in %s", t)
 	}
 	if t.date.After(t.expDate) {
 		glog.Fatalf("transaction date %s happened after expiration %s in %s",
@@ -272,25 +276,30 @@ func (p *portfolio) parseTransactions(records [][]string) {
 		}
 		p.cash = p.cash.Add(value).Add(comm).Add(fees)
 		var call bool
+		option := true
 		switch rec[15] {
 		case "PUT":
 		case "CALL":
 			call = true
 		case "":
-			p.parseNonOptionTransaction(rec)
-			continue
+			if rec[1] != "Trade" {
+				p.parseNonOptionTransaction(rec)
+				continue
+			}
+			// else: fallthrough (non-option transaction)
+			option = false
 		default:
 			glog.Fatalf("record #%d, bad put/call type: %q", i, rec[15])
 		}
 		mult, err := strconv.ParseUint(rec[11], 10, 16)
-		if err != nil {
+		if option && err != nil {
 			glog.Fatalf("record #%d, bad multiplier: %s", i, err)
 		}
 		expDate, err := time.Parse("1/02/06", rec[13])
-		if err != nil {
+		if option && err != nil {
 			glog.Fatalf("record #%d, bad transaction date: %s", i, err)
 		}
-		long := strings.HasPrefix(rec[2], "BUY_")
+		long := strings.HasPrefix(rec[2], "BUY")
 		// Pretend expiration is at 23:00 on the day of expiration so that
 		// expDate > tx date for transactions on the day of expiration.
 		expDate = expDate.Add(23 * time.Hour)
@@ -312,6 +321,7 @@ func (p *portfolio) parseTransactions(records [][]string) {
 			underlying:  rec[12],
 			expDate:     expDate,
 			strike:      parseDecimal(rec[14]),
+			option:      option,
 			call:        call,
 			long:        long,
 		}
@@ -345,7 +355,16 @@ func (p *portfolio) handleTransaction(tx *transaction) {
 		case "SELL_TO_CLOSE", "BUY_TO_CLOSE":
 			p.closePosition(tx, count)
 		default:
-			glog.Fatalf("Unhandled action type %q in %s", tx.action, tx)
+			if tx.instrument == "Future" {
+				// TODO check what happens for equities
+				if tx.value.Equal(decimal.Zero) { // Open
+					p.openPosition(tx)
+				} else { // Settle
+					p.closePosition(tx, count)
+				}
+			} else {
+				glog.Fatalf("Unhandled action type %q in %s %#v", tx.action, tx, tx)
+			}
 		}
 	case "Receive Deliver":
 		// We can't use closePosition() here because we don't know whether
@@ -387,11 +406,17 @@ func (p *portfolio) handleTransaction(tx *transaction) {
 
 func (p *portfolio) recordPL(tx *transaction, amount decimal.Decimal) {
 	p.rpl = p.rpl.Add(amount)
-	rpl, ok := p.rplPerUnderlying[tx.underlying]
+	var underlying string
+	if tx.option {
+		underlying = tx.underlying
+	} else {
+		underlying = tx.symbol
+	}
+	rpl, ok := p.rplPerUnderlying[underlying]
 	if ok {
 		amount = rpl.Add(amount)
 	}
-	p.rplPerUnderlying[tx.underlying] = amount
+	p.rplPerUnderlying[underlying] = amount
 }
 
 func (p *portfolio) openPosition(tx *transaction) {

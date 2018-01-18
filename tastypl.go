@@ -47,6 +47,7 @@ type transaction struct {
 	expDate     time.Time
 	strike      decimal.Decimal
 	option      bool // or non-option (such as future/equity) if false
+	mtm         bool // mark-to-market daily settlement for futures
 	call        bool // or put if false
 	long        bool // or short if false
 }
@@ -109,6 +110,9 @@ func (t *transaction) sanityCheck() {
 	}
 	if !t.option {
 		return // TODO: no other check yet for futures/equities
+	} else if t.mtm {
+		// Might not be true for options on futures (?)
+		glog.Fatalf("options position can't be marked-to-market in %s", t)
 	}
 	if t.strike.LessThanOrEqual(decimal.Zero) {
 		glog.Fatalf("strike price can't be less than or equal to zero in %s", t)
@@ -191,6 +195,8 @@ type portfolio struct {
 	// Summary of realized P&L per underlying
 	rplPerUnderlying map[string]decimal.Decimal
 
+	numTrades uint16 // Number of trades executed
+
 	// Number of times we got assigned.
 	assigned uint16
 	assTotal decimal.Decimal
@@ -231,8 +237,8 @@ func (p *portfolio) parseNonOptionTransaction(record []string) {
 		case "ACH DEPOSIT", "ACH DISBURSEMENT":
 			p.ach = p.ach.Add(amount)
 		default:
-			// Interest paid, e.g. "FROM 10/16 THRU 11/15 @ 8    %"
 			if strings.HasPrefix(record[5], "FROM ") {
+				// Interest paid, e.g. "FROM 10/16 THRU 11/15 @ 8    %"
 				p.intrs = p.intrs.Add(amount)
 				return
 			}
@@ -276,17 +282,25 @@ func (p *portfolio) parseTransactions(records [][]string) {
 		}
 		p.cash = p.cash.Add(value).Add(comm).Add(fees)
 		var call bool
+		var mtm bool
 		option := true
 		switch rec[15] {
 		case "PUT":
 		case "CALL":
 			call = true
 		case "":
+			// Handle non-trade transactions.
 			if rec[1] != "Trade" {
-				p.parseNonOptionTransaction(rec)
-				continue
+				// Detect daily mark-to-market of futures held overnight
+				if rec[1] == "Money Movement" && rec[4] == "Future" &&
+					strings.HasSuffix(rec[5], "Final settlement price") {
+					mtm = true
+				} else {
+					p.parseNonOptionTransaction(rec)
+					continue
+				}
 			}
-			// else: fallthrough (non-option transaction)
+			// else: fallthrough (this is a trade but a non-option transaction)
 			option = false
 		default:
 			glog.Fatalf("record #%d, bad put/call type: %q", i, rec[15])
@@ -302,7 +316,9 @@ func (p *portfolio) parseTransactions(records [][]string) {
 		long := strings.HasPrefix(rec[2], "BUY")
 		// Pretend expiration is at 23:00 on the day of expiration so that
 		// expDate > tx date for transactions on the day of expiration.
-		expDate = expDate.Add(23 * time.Hour)
+		if option {
+			expDate = expDate.Add(23 * time.Hour)
+		}
 		qty := parseDecimal(rec[7])
 		tx := &transaction{
 			date:        date,
@@ -322,6 +338,7 @@ func (p *portfolio) parseTransactions(records [][]string) {
 			expDate:     expDate,
 			strike:      parseDecimal(rec[14]),
 			option:      option,
+			mtm:         mtm,
 			call:        call,
 			long:        long,
 		}
@@ -349,6 +366,7 @@ func (p *portfolio) handleTransaction(tx *transaction) {
 	}
 	switch tx.txType {
 	case "Trade":
+		p.numTrades++
 		switch tx.action {
 		case "SELL_TO_OPEN", "BUY_TO_OPEN":
 			p.openPosition(tx)
@@ -399,6 +417,24 @@ func (p *portfolio) handleTransaction(tx *transaction) {
 			glog.Fatalf("Left with %d position after handling %s", quantity, tx)
 		}
 		delete(p.positions, tx.symbol)
+	case "Money Movement":
+		// Handle daily mark-to-market settlement of futures
+		if !tx.mtm {
+			glog.Fatalf("Unhandled money movement transaction in %s", tx)
+		}
+		pos, ok := p.positions[tx.symbol]
+		if !ok {
+			glog.Fatalf("Couldn't find an opening transaction for %s", tx)
+		}
+		if glog.V(4) {
+			descs := make([]string, len(pos.opens))
+			for i, open := range pos.opens {
+				descs[i] = open.String()
+			}
+			glog.Infof("%s -> %s ==> mark-to-market = %s",
+				strings.Join(descs, ", "), tx, tx.value)
+		}
+		p.recordPL(tx, tx.value)
 	default:
 		glog.Fatalf("Unhandled transaction type %q in %s", tx.txType, tx)
 	}
@@ -503,14 +539,17 @@ func (p *portfolio) PrintStats() {
 		fmt.Println("----- Overall statistics ----")
 	}
 	const day = 24 * time.Hour
-	ntx := len(p.transactions)
+	numTrades := p.numTrades
 	var beginTime time.Time
 	if p.ytd {
 		beginTime = ytdStart
-		for i, tx := range p.transactions {
+		var n uint16
+		for _, tx := range p.transactions {
 			if tx.ytd() { // Once we find the first YTD transaction...
-				ntx -= i // ... discount all the ones before.
+				numTrades -= n // ... discount all the ones before.
 				break
+			} else if tx.txType == "Trade" {
+				n++
 			}
 		}
 	} else {
@@ -522,7 +561,7 @@ func (p *portfolio) PrintStats() {
 		return amount.Mul(oneHundred).Div(p.rpl).StringFixed(2) + "%"
 	}
 	fmt.Printf("Number of transactions: %5d    (in %d days => %.1f/day avg)\n",
-		ntx, days, float32(ntx)/float32(days))
+		numTrades, days, float32(numTrades)/float32(days))
 	fmt.Printf("Realized P&L:           %8s\n", p.rpl.StringFixed(2))
 	fmt.Printf("Commissions:            %8s (%s of P&L)\n", p.comms.StringFixed(2), pct(p.comms))
 	fmt.Printf("Fees:                   %8s (%s of P&L)\n", p.fees.StringFixed(2), pct(p.fees))

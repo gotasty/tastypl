@@ -27,6 +27,8 @@ import (
 
 	"github.com/golang/glog"
 	"github.com/shopspring/decimal"
+	chart "github.com/wcharczuk/go-chart"
+	"github.com/wcharczuk/go-chart/util"
 )
 
 type transaction struct {
@@ -230,6 +232,8 @@ type portfolio struct {
 
 	cash decimal.Decimal // Cash on hand
 
+	premium decimal.Decimal // Sum of premium for currently open positions.
+
 	rpl   decimal.Decimal // Total realized P&L
 	comms decimal.Decimal
 	fees  decimal.Decimal
@@ -301,6 +305,29 @@ func (p *portfolio) parseNonOptionTransaction(record []string) {
 	}
 }
 
+// AddTransaction adds an individual transaction.  Usually all the
+// transactions are passed to the constructor and bulk-imported.
+// Transactions must be added in chronological order.
+func (p *portfolio) AddTransaction(record []string) {
+	tx := p.parseTransaction(len(p.transactions), record, &p.ytd)
+	if tx == nil {
+		return
+	}
+	p.transactions = append(p.transactions, tx)
+
+	prevTime := p.transactions[len(p.transactions)-1].date
+	if prevTime.After(tx.date) {
+		glog.Fatalf("adding a transaction out of order at time %s (last=%s tx=%s)",
+			prevTime, tx.date, tx)
+	} else if tx.date.Sub(prevTime) > rollWindow && len(p.recentTx) > 0 {
+		// More than rollWindow time has elapsed between two transactions,
+		// clear our map of recent transactions as we can't possibly find
+		// any rolls in it anymore.
+		p.recentTx = make(map[recentKey][]*transaction)
+	}
+	p.handleTransaction(tx)
+}
+
 // parseTransactions parses raw transactions from the CSV and adds them to the
 // transaction history.
 func (p *portfolio) parseTransactions(records [][]string) {
@@ -308,110 +335,116 @@ func (p *portfolio) parseTransactions(records [][]string) {
 	var j int
 	ytd := p.ytd
 	for i, rec := range records {
-		date, err := time.Parse(almostRFC3339, rec[0])
-		if err != nil {
-			glog.Fatalf("record #%d, bad transaction date: %s", i, err)
+		if tx := p.parseTransaction(i, rec, &ytd); tx != nil {
+			p.transactions[j] = tx
+			j++
 		}
-		if ytd && date.After(ytdStart) {
-			// Reset running counts as we only want YTD numbers.
-			p.miscCash = decimal.Zero
-			p.intrs = decimal.Zero
-			p.ach = decimal.Zero
-			// Note: we don't reset p.cash as the only way to have the correct
-			// amount of cash ultimately in the account is of course to take
-			// into account (bad pun, sorry) the entire account history.
-			ytd = false // So we don't reset again.
-		}
-		value := parseDecimal(rec[6])
-		comm := parseDecimal(rec[9])
-		if comm.GreaterThan(decimal.Zero) {
-			glog.Fatalf("record #%d, positive commission amount %s", i, rec[9])
-		}
-		fees := parseDecimal(rec[10])
-		if fees.GreaterThan(decimal.Zero) {
-			glog.Fatalf("record #%d, positive fees amount %s", i, rec[10])
-		}
-		instrument := rec[4]
-		p.cash = p.cash.Add(value).Add(comm).Add(fees)
-		var call bool
-		var mtm bool
-		option := true
-		switch rec[15] {
-		case "PUT":
-		case "CALL":
-			call = true
-		case "":
-			// Handle non-trade transactions.
-			if rec[1] != "Trade" {
-				// Detect daily mark-to-market of futures held overnight
-				if rec[1] == "Money Movement" && instrument == "Future" &&
-					strings.HasSuffix(rec[5], "Final settlement price") {
-					mtm = true
-				} else {
-					p.parseNonOptionTransaction(rec)
-					continue
-				}
-			}
-			// else: fallthrough (this is a trade but a non-option transaction)
-			option = false
-		default:
-			glog.Fatalf("record #%d, bad put/call type: %q", i, rec[15])
-		}
-		mult, err := strconv.ParseUint(rec[11], 10, 16)
-		if option && err != nil {
-			glog.Fatalf("record #%d, bad multiplier: %s", i, err)
-		}
-		expDate, err := time.Parse("1/02/06", rec[13])
-		if option && err != nil {
-			glog.Fatalf("record #%d, bad transaction date: %s", i, err)
-		}
-		action := rec[2]
-		long := strings.HasPrefix(action, "BUY")
-		// Pretend expiration is at 23:00 on the day of expiration so that
-		// expDate > tx date for transactions on the day of expiration.
-		if option {
-			expDate = expDate.Add(23 * time.Hour)
-		}
-		qty := parseDecimal(rec[7])
-		tx := &transaction{
-			date:        date,
-			txType:      rec[1],
-			action:      action,
-			symbol:      rec[3],
-			instrument:  instrument,
-			description: rec[5],
-			value:       value,
-			quantity:    qty,
-			avgPrice:    parseDecimal(rec[8]),
-			commission:  comm,
-			fees:        fees,
-			multiplier:  uint16(mult),
-			underlying:  rec[12],
-			expDate:     expDate,
-			strike:      parseDecimal(rec[14]),
-			option:      option,
-			mtm:         mtm,
-			call:        call,
-			long:        long,
-			open:        strings.HasSuffix(action, "_TO_OPEN"),
-			qtyOpen:     qty,
-		}
-		if !option {
-			tx.underlying = tx.symbol
-		} else if !strings.HasPrefix(tx.symbol, tx.underlying) {
-			glog.Fatalf("invalid symbol %q for underlying %q in %s",
-				tx.symbol, tx.underlying, tx)
-		}
-		// Pending clarification from TW support.
-		//tx.fixFees()
-		tx.sanityCheck()
-		p.transactions[j] = tx
-		j++
 	}
 	if ignored := len(records) - j; ignored != 0 {
 		glog.V(3).Infof("Ignored %d non-option transactions", ignored)
 	}
 	p.transactions = p.transactions[:j]
+}
+
+func (p *portfolio) parseTransaction(i int, rec []string, ytd *bool) *transaction {
+	date, err := time.Parse(almostRFC3339, rec[0])
+	if err != nil {
+		glog.Fatalf("record #%d, bad transaction date: %s", i, err)
+	}
+	if *ytd && date.After(ytdStart) {
+		// Reset running counts as we only want YTD numbers.
+		p.miscCash = decimal.Zero
+		p.intrs = decimal.Zero
+		p.ach = decimal.Zero
+		// Note: we don't reset p.cash as the only way to have the correct
+		// amount of cash ultimately in the account is of course to take
+		// into account (bad pun, sorry) the entire account history.
+		*ytd = false // So we don't reset again.
+	}
+	value := parseDecimal(rec[6])
+	comm := parseDecimal(rec[9])
+	if comm.GreaterThan(decimal.Zero) {
+		glog.Fatalf("record #%d, positive commission amount %s", i, rec[9])
+	}
+	fees := parseDecimal(rec[10])
+	if fees.GreaterThan(decimal.Zero) {
+		glog.Fatalf("record #%d, positive fees amount %s", i, rec[10])
+	}
+	instrument := rec[4]
+	p.cash = p.cash.Add(value).Add(comm).Add(fees)
+	var call bool
+	var mtm bool
+	option := true
+	switch rec[15] {
+	case "PUT":
+	case "CALL":
+		call = true
+	case "":
+		// Handle non-trade transactions.
+		if rec[1] != "Trade" {
+			// Detect daily mark-to-market of futures held overnight
+			if rec[1] == "Money Movement" && instrument == "Future" &&
+				strings.HasSuffix(rec[5], "Final settlement price") {
+				mtm = true
+			} else {
+				p.parseNonOptionTransaction(rec)
+				return nil
+			}
+		}
+		// else: fallthrough (this is a trade but a non-option transaction)
+		option = false
+	default:
+		glog.Fatalf("record #%d, bad put/call type: %q", i, rec[15])
+	}
+	mult, err := strconv.ParseUint(rec[11], 10, 16)
+	if option && err != nil {
+		glog.Fatalf("record #%d, bad multiplier: %s", i, err)
+	}
+	expDate, err := time.Parse("1/02/06", rec[13])
+	if option && err != nil {
+		glog.Fatalf("record #%d, bad transaction date: %s", i, err)
+	}
+	action := rec[2]
+	long := strings.HasPrefix(action, "BUY")
+	// Pretend expiration is at 23:00 on the day of expiration so that
+	// expDate > tx date for transactions on the day of expiration.
+	if option {
+		expDate = expDate.Add(23 * time.Hour)
+	}
+	qty := parseDecimal(rec[7])
+	tx := &transaction{
+		date:        date,
+		txType:      rec[1],
+		action:      action,
+		symbol:      rec[3],
+		instrument:  instrument,
+		description: rec[5],
+		value:       value,
+		quantity:    qty,
+		avgPrice:    parseDecimal(rec[8]),
+		commission:  comm,
+		fees:        fees,
+		multiplier:  uint16(mult),
+		underlying:  rec[12],
+		expDate:     expDate,
+		strike:      parseDecimal(rec[14]),
+		option:      option,
+		mtm:         mtm,
+		call:        call,
+		long:        long,
+		open:        strings.HasSuffix(action, "_TO_OPEN"),
+		qtyOpen:     qty,
+	}
+	if !option {
+		tx.underlying = tx.symbol
+	} else if !strings.HasPrefix(tx.symbol, tx.underlying) {
+		glog.Fatalf("invalid symbol %q for underlying %q in %s",
+			tx.symbol, tx.underlying, tx)
+	}
+	// Pending clarification from TW support.
+	//tx.fixFees()
+	tx.sanityCheck()
+	return tx
 }
 
 func (p *portfolio) handleTransaction(tx *transaction) {
@@ -461,10 +494,11 @@ func (p *portfolio) handleTransaction(tx *transaction) {
 		quantity := tx.quantity.Abs() // clone
 		for _, open := range pos.opens {
 			glog.V(3).Infof("position %s expired by %s", open, tx)
+			p.premium = p.premium.Sub(open.value)
 			tx.openTx = open
 			quantity = quantity.Sub(open.quantity)
 			if assigned {
-				cost := open.strike.Mul(decimal.New(int64(open.multiplier), 0))
+				cost := open.strike.Mul(decimal.New(int64(open.multiplier), 0)).Sub(open.value)
 				if count {
 					p.assTotal = p.assTotal.Sub(cost)
 				}
@@ -519,6 +553,9 @@ func (p *portfolio) openPosition(tx *transaction) {
 		p.positions[tx.symbol] = pos
 	}
 	pos.opens = append(pos.opens, tx)
+	if tx.option {
+		p.premium = p.premium.Add(tx.value)
+	}
 }
 
 func (p *portfolio) closePosition(tx *transaction, count bool) {
@@ -534,6 +571,7 @@ func (p *portfolio) closePosition(tx *transaction, count bool) {
 			continue
 		}
 		closed := decimal.Min(remaining, open.qtyOpen)
+		p.premium = p.premium.Sub(open.avgPrice.Mul(closed))
 		remaining = remaining.Sub(closed)
 		// Close off this opening transaction.
 		open.qtyOpen = open.qtyOpen.Sub(closed)
@@ -721,6 +759,10 @@ func (p *portfolio) PrintStats() {
 	} else {
 		fmt.Println("----- Overall statistics ----")
 	}
+	if len(p.transactions) < 2 {
+		fmt.Println("Not enough transactions yet")
+		return
+	}
 	const day = 24 * time.Hour
 	numTrades := p.numTrades
 	var beginTime time.Time
@@ -762,10 +804,16 @@ func (p *portfolio) PrintStats() {
 	var premium decimal.Decimal
 	for _, pos := range p.positions {
 		for _, open := range pos.opens {
-			premium = premium.Add(open.value)
+			if open.option {
+				premium = premium.Add(open.value)
+			}
 		}
 	}
-	fmt.Printf("Outstanding premium:    %8s\n", premium.StringFixed(2))
+	fmt.Printf("Outstanding premium:    %8s\n", p.premium.StringFixed(2))
+	if !premium.Equal(p.premium) {
+		fmt.Printf("-> Warning: estimated outstanding premium should've been %s (difference: %s)\n",
+			premium.StringFixed(2), premium.Sub(p.premium).StringFixed(2))
+	}
 	fmt.Printf("Cash on hand:           %8s\n", p.cash.StringFixed(2))
 	if !p.ytd {
 		// Alternative method to compute cash on hand
@@ -791,12 +839,94 @@ func (p *portfolio) PrintPL() {
 	}
 }
 
+func dumpChart(records [][]string, ytd bool) {
+	// We don't really have a good way to track stats step by step, so rebuild the
+	// portfolio by adding the transactions one by one for now.
+	portfolio := NewPortfolio(records[1:2], ytd) // Just the first transaction
+	var xv []time.Time
+	var rpl []float64
+	var adjRpl []float64
+	var premium []float64
+	var cash []float64
+	for _, record := range records[2:] {
+		//fmt.Println("----------------------------------->", record)
+		portfolio.AddTransaction(record)
+		//portfolio.PrintStats()
+		date, err := time.Parse(almostRFC3339, record[0])
+		if err != nil {
+			glog.Fatalf("record #%d, bad transaction date: %s", len(portfolio.transactions), err)
+		}
+		amount, _ := portfolio.rpl.Float64()
+		xv = append(xv, date)
+		rpl = append(rpl, amount)
+		grosspl := portfolio.rpl.Add(portfolio.comms).Add(portfolio.fees).Add(portfolio.intrs)
+		amount, _ = grosspl.Float64()
+		adjRpl = append(adjRpl, amount)
+		amount, _ = portfolio.premium.Float64()
+		premium = append(premium, amount)
+		amount, _ = portfolio.cash.Float64()
+		cash = append(cash, amount)
+	}
+
+	graph := chart.Chart{
+		XAxis: chart.XAxis{
+			Style:          chart.StyleShow(),
+			TickPosition:   chart.TickPositionBetweenTicks,
+			ValueFormatter: chart.TimeHourValueFormatter,
+			Range: &chart.MarketHoursRange{
+				MarketOpen:      util.NYSEOpen(),
+				MarketClose:     util.NYSEClose(),
+				HolidayProvider: util.Date.IsNYSEHoliday,
+			},
+		},
+		YAxis: chart.YAxis{
+			Style: chart.StyleShow(),
+		},
+		Series: []chart.Series{
+			chart.TimeSeries{
+				Name:    "Realized P&L",
+				XValues: xv,
+				YValues: rpl,
+				Style: chart.Style{
+					StrokeDashArray: []float64{5.0, 5.0},
+				},
+			},
+			chart.TimeSeries{
+				Name:    "Adjusted Realized P&L",
+				XValues: xv,
+				YValues: adjRpl,
+			},
+			chart.TimeSeries{
+				Name:    "Outstanding Premium",
+				XValues: xv,
+				YValues: premium,
+			},
+			chart.TimeSeries{
+				Name:    "Cash on hand",
+				XValues: xv,
+				YValues: cash,
+			},
+		},
+	}
+	graph.Elements = []chart.Renderable{
+		chart.Legend(&graph),
+	}
+
+	rplPng, err := os.Create("/tmp/rpl.png")
+	if err != nil {
+		glog.Fatal(err)
+	}
+	defer rplPng.Close()
+	graph.Render(chart.PNG, rplPng)
+}
+
 func main() {
 	input := flag.String("input", "", "input csv file containing tastyworks transactions")
 	stats := flag.Bool("stats", true, "print overall statistics")
 	ytd := flag.Bool("ytd", false, "limit output to YTD transactions")
 	printPL := flag.Bool("printpl", false, "print realized P&L per underlying")
 	positions := flag.Bool("positions", false, "print current positions")
+	chart := flag.Bool("chart", false, "create a chart of P&L")
 	flag.Parse()
 	if *input == "" {
 		glog.Fatal("-input flag required")
@@ -815,6 +945,9 @@ func main() {
 	}
 	if *printPL {
 		portfolio.PrintPL()
+	}
+	if *chart {
+		dumpChart(records, *ytd)
 	}
 	if *positions {
 		portfolio.PrintPositions()

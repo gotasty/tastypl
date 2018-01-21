@@ -30,15 +30,16 @@ import (
 )
 
 type transaction struct {
+	// Initial group of fields straight from the CSV.  Those should be
+	// considered immutable, don't change the values imported from the CSV.
 	date        time.Time
 	txType      string
 	action      string
-	symbol      string // OCC symbol
+	symbol      string // OCC symbol for options, or underlying name otherwise
 	instrument  string
 	description string
 	value       decimal.Decimal
 	quantity    decimal.Decimal
-	qtyOpen     decimal.Decimal // starts as quantity, decremented when closed
 	avgPrice    decimal.Decimal
 	commission  decimal.Decimal
 	fees        decimal.Decimal
@@ -46,10 +47,27 @@ type transaction struct {
 	underlying  string
 	expDate     time.Time
 	strike      decimal.Decimal
-	option      bool // or non-option (such as future/equity) if false
-	mtm         bool // mark-to-market daily settlement for futures
-	call        bool // or put if false
-	long        bool // or short if false
+
+	// Various flags inferred from the transactions to help make things simpler.
+	option bool // or non-option (such as future/equity) if false
+	mtm    bool // mark-to-market daily settlement for futures
+	call   bool // or put if false
+	long   bool // or short if false
+	open   bool // or closing transaction if false.  Only used on options.
+
+	// Starts as quantity, decremented as we close the position.
+	// Only really meaningful for opening transactions.
+	qtyOpen decimal.Decimal
+	// If this is an opening options transaction and we detected that this was
+	// the result of a roll, this points to the closing transaction of the
+	// position we rolled from.
+	rolledFrom *transaction
+	// Realized P&L on this transaction.
+	// Only really meaningful for closing transactions.
+	rpl decimal.Decimal
+	// Opening transaction from which the realized P&L was made.
+	// Only really meaningful for closing transactions.
+	openTx *transaction
 }
 
 var (
@@ -62,6 +80,16 @@ var (
 
 func (t *transaction) String() string {
 	return t.description
+}
+
+func (t *transaction) NetCredit() decimal.Decimal {
+	net := t.value
+	earlier := t.rolledFrom
+	for earlier != nil {
+		net = net.Add(earlier.rpl)
+		earlier = earlier.openTx.rolledFrom
+	}
+	return net
 }
 
 // per contract fees, see:
@@ -172,11 +200,28 @@ type position struct {
 	opens []*transaction
 }
 
+// We consider other transactions within this time window as candidates
+// when trying to detect rolls.
+const rollWindow = 30 * time.Second
+
+// Used to track recent transactions to detect rolls (for options only).
+type recentKey struct {
+	underlying string
+	quantity   uint8
+	call       bool // or put if false
+	long       bool // or short if false
+	open       bool // or closing transaction if false.
+}
+
 type portfolio struct {
 	ytd bool // Only track YTD transactions
 
 	// All transactions.
 	transactions []*transaction
+
+	// Recent transactions, used to detect rolls of options positions.
+	// Transactions older than rollWindow should get purged.
+	recentTx map[recentKey][]*transaction
 
 	ach decimal.Decimal // sum of all ACH movements
 
@@ -185,7 +230,7 @@ type portfolio struct {
 
 	cash decimal.Decimal // Cash on hand
 
-	rpl   decimal.Decimal // Realized P&L
+	rpl   decimal.Decimal // Total realized P&L
 	comms decimal.Decimal
 	fees  decimal.Decimal
 	intrs decimal.Decimal // interest
@@ -206,6 +251,7 @@ func NewPortfolio(records [][]string, ytd bool) *portfolio {
 	p := &portfolio{
 		ytd:              ytd,
 		positions:        make(map[string]*position),
+		recentTx:         make(map[recentKey][]*transaction),
 		rplPerUnderlying: make(map[string]decimal.Decimal),
 	}
 
@@ -220,6 +266,11 @@ func NewPortfolio(records [][]string, ytd bool) *portfolio {
 	for _, tx := range p.transactions {
 		if prevTime.After(tx.date) {
 			glog.Fatalf("transaction log out of order at time %s (tx=%s)", tx.date, tx)
+		} else if tx.date.Sub(prevTime) > rollWindow && len(p.recentTx) > 0 {
+			// More than rollWindow time has elapsed between two transactions,
+			// clear our map of recent transactions as we can't possibly find
+			// any rolls in it anymore.
+			p.recentTx = make(map[recentKey][]*transaction)
 		}
 		prevTime = tx.date
 		p.handleTransaction(tx)
@@ -280,6 +331,7 @@ func (p *portfolio) parseTransactions(records [][]string) {
 		if fees.GreaterThan(decimal.Zero) {
 			glog.Fatalf("record #%d, positive fees amount %s", i, rec[10])
 		}
+		instrument := rec[4]
 		p.cash = p.cash.Add(value).Add(comm).Add(fees)
 		var call bool
 		var mtm bool
@@ -292,7 +344,7 @@ func (p *portfolio) parseTransactions(records [][]string) {
 			// Handle non-trade transactions.
 			if rec[1] != "Trade" {
 				// Detect daily mark-to-market of futures held overnight
-				if rec[1] == "Money Movement" && rec[4] == "Future" &&
+				if rec[1] == "Money Movement" && instrument == "Future" &&
 					strings.HasSuffix(rec[5], "Final settlement price") {
 					mtm = true
 				} else {
@@ -313,7 +365,8 @@ func (p *portfolio) parseTransactions(records [][]string) {
 		if option && err != nil {
 			glog.Fatalf("record #%d, bad transaction date: %s", i, err)
 		}
-		long := strings.HasPrefix(rec[2], "BUY")
+		action := rec[2]
+		long := strings.HasPrefix(action, "BUY")
 		// Pretend expiration is at 23:00 on the day of expiration so that
 		// expDate > tx date for transactions on the day of expiration.
 		if option {
@@ -323,13 +376,12 @@ func (p *portfolio) parseTransactions(records [][]string) {
 		tx := &transaction{
 			date:        date,
 			txType:      rec[1],
-			action:      rec[2],
+			action:      action,
 			symbol:      rec[3],
-			instrument:  rec[4],
+			instrument:  instrument,
 			description: rec[5],
 			value:       value,
 			quantity:    qty,
-			qtyOpen:     qty,
 			avgPrice:    parseDecimal(rec[8]),
 			commission:  comm,
 			fees:        fees,
@@ -341,8 +393,12 @@ func (p *portfolio) parseTransactions(records [][]string) {
 			mtm:         mtm,
 			call:        call,
 			long:        long,
+			open:        strings.HasSuffix(action, "_TO_OPEN"),
+			qtyOpen:     qty,
 		}
-		if !strings.HasPrefix(tx.symbol, tx.underlying) {
+		if !option {
+			tx.underlying = tx.symbol
+		} else if !strings.HasPrefix(tx.symbol, tx.underlying) {
 			glog.Fatalf("invalid symbol %q for underlying %q in %s",
 				tx.symbol, tx.underlying, tx)
 		}
@@ -370,8 +426,10 @@ func (p *portfolio) handleTransaction(tx *transaction) {
 		switch tx.action {
 		case "SELL_TO_OPEN", "BUY_TO_OPEN":
 			p.openPosition(tx)
+			p.detectRoll(tx)
 		case "SELL_TO_CLOSE", "BUY_TO_CLOSE":
 			p.closePosition(tx, count)
+			p.detectRoll(tx)
 		default:
 			if tx.instrument == "Future" {
 				// TODO check what happens for equities
@@ -403,14 +461,19 @@ func (p *portfolio) handleTransaction(tx *transaction) {
 		quantity := tx.quantity.Abs() // clone
 		for _, open := range pos.opens {
 			glog.V(3).Infof("position %s expired by %s", open, tx)
+			tx.openTx = open
 			quantity = quantity.Sub(open.quantity)
-			if count {
-				if assigned {
-					cost := open.strike.Mul(decimal.New(int64(open.multiplier), 0))
+			if assigned {
+				cost := open.strike.Mul(decimal.New(int64(open.multiplier), 0))
+				if count {
 					p.assTotal = p.assTotal.Sub(cost)
-				} else {
+				}
+				tx.rpl = cost
+			} else {
+				if count {
 					p.recordPL(open, open.value)
 				}
+				tx.rpl = open.value
 			}
 		}
 		if !quantity.Equal(decimal.Zero) {
@@ -442,17 +505,11 @@ func (p *portfolio) handleTransaction(tx *transaction) {
 
 func (p *portfolio) recordPL(tx *transaction, amount decimal.Decimal) {
 	p.rpl = p.rpl.Add(amount)
-	var underlying string
-	if tx.option {
-		underlying = tx.underlying
-	} else {
-		underlying = tx.symbol
-	}
-	rpl, ok := p.rplPerUnderlying[underlying]
+	rpl, ok := p.rplPerUnderlying[tx.underlying]
 	if ok {
 		amount = rpl.Add(amount)
 	}
-	p.rplPerUnderlying[underlying] = amount
+	p.rplPerUnderlying[tx.underlying] = amount
 }
 
 func (p *portfolio) openPosition(tx *transaction) {
@@ -483,6 +540,8 @@ func (p *portfolio) closePosition(tx *transaction, count bool) {
 		rpl := open.avgPrice.Add(tx.avgPrice).Mul(closed)
 		glog.V(4).Infof("%s -> %s [%s+%s] ==> realized P&L = %s",
 			open, tx, open.avgPrice, tx.avgPrice, rpl)
+		tx.openTx = open
+		tx.rpl = rpl
 		if count {
 			p.recordPL(tx, rpl)
 		}
@@ -518,16 +577,140 @@ func (p *portfolio) closePosition(tx *transaction, count bool) {
 	}
 }
 
+// Detect rolled options position.  We consider two transactions to make up a
+// roll if they fulfill the following conditions:
+//   1. They are for the same underlying and same type of option (e.g. both
+//      put or call) but opposite sides of the market (one long and one short)
+//   2. The two transactions happened within a 30s window.
+//   3. The two transactions have the same number of contracts.
+//   4. One of the two transactions is a closing transaction, the other is an
+//      opening transaction.
+func (p *portfolio) detectRoll(tx *transaction) {
+	if !tx.option {
+		glog.Fatalf("non-option transaction can't be a roll: %s", tx)
+	}
+	qty := tx.quantity.IntPart()
+	if !decimal.New(qty, 0).Equal(tx.quantity) {
+		glog.Fatalf("Non-whole number of contracts %s in %s", tx.quantity, tx)
+	} else if qty > 255 {
+		glog.Fatalf("Really, more than 255 contracts?! %s", tx)
+	}
+	// Look for an earlier transaction that could make up a roll.
+	key := recentKey{
+		underlying: tx.underlying, // Look for the same underlying
+		quantity:   uint8(qty),    // and same number of contracts
+		call:       tx.call,       // and same type of option (both puts or both calls)
+		long:       !tx.long,      // but opposite side of the market
+		open:       !tx.open,      // and opening if we're closing or vice versa
+	}
+	recent, ok := p.recentTx[key]
+	if ok { // Look for a matching transaction.
+		for i, earlier := range recent {
+			if earlier == nil {
+				continue
+			}
+			if earlier.date.After(tx.date) {
+				glog.Fatalf("recentTx out of order at time %s (tx=%s)", tx.date, tx)
+			} else if t := tx.date.Sub(earlier.date); t > rollWindow {
+				glog.V(4).Infof("%s is not a roll of %s as they are %s apart",
+					tx, earlier, t)
+				continue
+			}
+			if !tx.open {
+				tx, earlier = earlier, tx
+			}
+			glog.V(2).Infof("detected roll: %s -> %s (P&L: %s)", earlier, tx, earlier.rpl)
+			recent[i] = nil // So we don't try to re-use this recent transaction
+			tx.rolledFrom = earlier
+			return
+		}
+	}
+
+	// We didn't find a roll, record this transaction in our recent
+	// transactions in case there is another one shortly after this one that
+	// constitutes a roll when coupled with this one.
+	key.long = tx.long
+	key.open = tx.open
+	recent, ok = p.recentTx[key]
+	if !ok {
+		p.recentTx[key] = []*transaction{tx}
+		return
+	}
+	p.recentTx[key] = append(recent, tx)
+}
+
 func (p *portfolio) PrintPositions() {
 	fmt.Println("----- Current portfolio -----")
-	for symbol, pos := range p.positions {
-		if len(pos.opens) == 1 {
-			fmt.Println(symbol, pos.opens[0])
-		} else {
-			fmt.Println(symbol)
-			for i, open := range pos.opens {
-				fmt.Printf("    %d: %s\n", i, open)
+
+	// First group all the positions per underlying
+	perUnderlying := make(map[string]*position, len(p.positions))
+	for _, pos := range p.positions {
+		for _, open := range pos.opens {
+			pos, ok := perUnderlying[open.underlying]
+			if !ok {
+				pos = new(position)
+				perUnderlying[open.underlying] = pos
 			}
+			pos.opens = append(pos.opens, open)
+		}
+	}
+
+	// Sort the underlying names
+	underlyings := make([]string, len(perUnderlying))
+	var i int
+	for underlying := range perUnderlying {
+		underlyings[i] = underlying
+		i++
+	}
+	sort.Sort(sort.StringSlice(underlyings))
+
+	thisYear := time.Now().Year()
+	for _, underlying := range underlyings {
+		pos := perUnderlying[underlying]
+		var plural string
+		if len(pos.opens) > 1 {
+			plural = "s"
+		}
+		fmt.Printf("%-5s(%d position%s)\n", underlying, len(pos.opens), plural)
+		sort.Slice(pos.opens, func(i, j int) bool {
+			a := pos.opens[i]
+			b := pos.opens[j]
+			if a.expDate.Before(b.expDate) {
+				return true
+			} else if a.expDate.After(b.expDate) {
+				return false
+			}
+			// Same exp date, break tie by strike.
+			return a.strike.LessThan(b.strike)
+		})
+		for _, open := range pos.opens {
+			var expFmt string
+			if open.expDate.Year() == thisYear {
+				expFmt = "Jan 02"
+			} else {
+				expFmt = "Jan 02 '06"
+			}
+			var long string
+			if open.long {
+				long = "long "
+			} else {
+				long = "short"
+			}
+			var call string
+			if open.call {
+				call = "call"
+			} else {
+				call = "put "
+			}
+			mult := decimal.New(int64(open.multiplier), 0)
+			var net string
+			// TODO: Handle transitive rolls
+			if open.rolledFrom != nil {
+				net = fmt.Sprintf(" (net credit %s)", open.NetCredit().Div(mult).StringFixed(2))
+			}
+			fmt.Printf("  %s %s %s $%s %s @ %s%s\n",
+				open.expDate.Format(expFmt), long, open.qtyOpen, open.strike,
+				call, open.value.Div(mult).StringFixed(2), net)
 		}
 	}
 }
@@ -558,6 +741,9 @@ func (p *portfolio) PrintStats() {
 	duration := p.transactions[len(p.transactions)-1].date.Sub(beginTime).Round(day)
 	days := int(duration / day)
 	pct := func(amount decimal.Decimal) string {
+		if p.rpl.Equal(decimal.Zero) {
+			return "0%"
+		}
 		return amount.Mul(oneHundred).Div(p.rpl).StringFixed(2) + "%"
 	}
 	fmt.Printf("Number of transactions: %5d    (in %d days => %.1f/day avg)\n",

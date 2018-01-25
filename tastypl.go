@@ -143,6 +143,8 @@ func (t *transaction) sanityCheck() {
 	} else if t.mtm {
 		// Might not be true for options on futures (?)
 		glog.Fatalf("options position can't be marked-to-market in %s", t)
+	} else if t.multiplier == 0 {
+		glog.Fatalf("options position must have a non-zero multiplier in %s", t)
 	}
 	if t.strike.LessThanOrEqual(decimal.Zero) {
 		glog.Fatalf("strike price can't be less than or equal to zero in %s", t)
@@ -684,10 +686,14 @@ func (p *portfolio) PrintPositions() {
 	perUnderlying := make(map[string]*position, len(p.positions))
 	for _, pos := range p.positions {
 		for _, open := range pos.opens {
-			pos, ok := perUnderlying[open.underlying]
+			underlying := open.underlying
+			if open.instrument == "Future" {
+				underlying = underlying[:len(underlying)-2]
+			}
+			pos, ok := perUnderlying[underlying]
 			if !ok {
 				pos = new(position)
-				perUnderlying[open.underlying] = pos
+				perUnderlying[underlying] = pos
 			}
 			pos.opens = append(pos.opens, open)
 		}
@@ -722,17 +728,21 @@ func (p *portfolio) PrintPositions() {
 			return a.strike.LessThan(b.strike)
 		})
 		for _, open := range pos.opens {
-			var expFmt string
-			if open.expDate.Year() == thisYear {
-				expFmt = "Jan 02"
-			} else {
-				expFmt = "Jan 02 '06"
-			}
 			var long string
 			if open.long {
 				long = "long "
 			} else {
 				long = "short"
+			}
+			if !open.option {
+				fmt.Printf("  %s\n", open)
+				continue
+			}
+			var expFmt string
+			if open.expDate.Year() == thisYear {
+				expFmt = "Jan 02"
+			} else {
+				expFmt = "Jan 02 '06"
 			}
 			var call string
 			if open.call {
@@ -744,7 +754,11 @@ func (p *portfolio) PrintPositions() {
 			var net string
 			// TODO: Handle transitive rolls
 			if open.rolledFrom != nil {
-				net = fmt.Sprintf(" (net credit %s)", open.NetCredit().Div(mult).StringFixed(2))
+				netcr := open.NetCredit()
+				if netcr.LessThanOrEqual(open.value) {
+					net = fmt.Sprintf(", booked loss %s", open.value.Sub(netcr).Div(mult).StringFixed(2))
+				}
+				net = fmt.Sprintf(" (net credit %s%s)", netcr.Div(mult).StringFixed(2), net)
 			}
 			fmt.Printf("  %s %s %s $%s %s @ %s%s\n",
 				open.expDate.Format(expFmt), long, open.qtyOpen, open.strike,

@@ -283,38 +283,44 @@ func NewPortfolio(records [][]string, ytd bool) *portfolio {
 		// transaction point to the equity transaction.
 		if tx.txType == "Receive Deliver" && i != len(p.transactions)-1 {
 			nextTx := p.transactions[i+1]
-			if nextTx.txType == "Receive Deliver" &&
-				tx.date.Equal(nextTx.date) {
-				var op *transaction
-				var buy bool
-				if tx.option {
-					op = tx
-					buy = nextTx.long
-				} else if nextTx.option {
-					op = nextTx
-					buy = tx.long
-				}
-				shares := op.quantity.Mul(decimal.New(int64(op.multiplier), 0))
-				price := op.strike.Mul(shares)
-				if buy {
-					price = price.Neg()
-				}
-				if tx.openTx == nil && tx.action == "" &&
-					nextTx.action != "" && tx.underlying == nextTx.symbol &&
-					nextTx.quantity.Equal(shares) && nextTx.value.Equal(price) {
-					// First case: option transaction appears before equity transaction.
-					tx.openTx = nextTx
-				} else if nextTx.openTx == nil && tx.action != "" &&
-					nextTx.action == "" && tx.symbol == nextTx.underlying &&
-					tx.quantity.Equal(shares) && tx.value.Equal(price) {
-					// Second case: equity transaction appears before option transaction.
-					nextTx.openTx = tx
-				}
-			}
+			p.maybeLinkAssignmentExercises(tx, nextTx)
 		}
 		p.handleTransaction(tx)
 	}
 	return p
+}
+
+func (p *portfolio) maybeLinkAssignmentExercises(tx, nextTx *transaction) {
+	if !(nextTx.txType == "Receive Deliver" && tx.date.Equal(nextTx.date)) {
+		return
+	}
+	var op *transaction
+	var buy bool
+	if tx.option {
+		op = tx
+		buy = nextTx.long
+	} else if nextTx.option {
+		op = nextTx
+		buy = tx.long
+	} else {
+		return
+	}
+	shares := op.quantity.Mul(decimal.New(int64(op.multiplier), 0))
+	price := op.strike.Mul(shares)
+	if buy {
+		price = price.Neg()
+	}
+	if tx.openTx == nil && tx.action == "" &&
+		nextTx.action != "" && tx.underlying == nextTx.symbol &&
+		nextTx.quantity.Equal(shares) && nextTx.value.Equal(price) {
+		// First case: option transaction appears before equity transaction.
+		tx.openTx = nextTx
+	} else if nextTx.openTx == nil && tx.action != "" &&
+		nextTx.action == "" && tx.symbol == nextTx.underlying &&
+		tx.quantity.Equal(shares) && tx.value.Equal(price) {
+		// Second case: equity transaction appears before option transaction.
+		nextTx.openTx = tx
+	}
 }
 
 func (p *portfolio) parseNonOptionTransaction(record []string) {
@@ -349,6 +355,11 @@ func (p *portfolio) AddTransaction(record []string) {
 		return
 	}
 	p.transactions = append(p.transactions, tx)
+	defer func() {
+		if e := recover(); e != nil {
+			panic(fmt.Errorf("when handling %s: %v", record, e))
+		}
+	}()
 
 	prevTime := p.transactions[len(p.transactions)-1].date
 	if prevTime.After(tx.date) {
@@ -359,6 +370,10 @@ func (p *portfolio) AddTransaction(record []string) {
 		// clear our map of recent transactions as we can't possibly find
 		// any rolls in it anymore.
 		p.recentTx = make(map[recentKey][]*transaction)
+	}
+	if tx.txType == "Receive Deliver" {
+		prevTx := p.transactions[len(p.transactions)-2]
+		p.maybeLinkAssignmentExercises(prevTx, tx)
 	}
 	p.handleTransaction(tx)
 }
@@ -541,7 +556,7 @@ func (p *portfolio) handleAssignmentOrExercise(tx *transaction, count bool) {
 				p.recordPL(open, open.value)
 			}
 			tx.openTx = open
-		} else {
+		} else if tx.openTx != nil {
 			// Adjust the cost basis of the underlying position by the amount of
 			// premium in the original option position.
 			if tx.openTx.open {
@@ -553,6 +568,13 @@ func (p *portfolio) handleAssignmentOrExercise(tx *transaction, count bool) {
 					p.recordPL(tx.openTx, open.value)
 				}
 			}
+		} else {
+			// This is kind of a hack: if we couldn't link the two assignment/exercise
+			// transactions together, we fall back to recording the P&L of options
+			// separately here (rather than trying to adjust the cost basis / P&L in the
+			// underlying).  We need this to properly compute P&L when adding transactions
+			// incrementally with AddTransaction().
+			p.recordPL(open, open.value)
 		}
 	}
 	if !quantity.Equal(decimal.Zero) {
@@ -827,7 +849,6 @@ func (p *portfolio) PrintPositions() {
 				call = "put "
 			}
 			mult := decimal.New(int64(open.multiplier), 0)
-			// TODO: Handle transitive rolls
 			if open.rolledFrom != nil {
 				netcr := open.NetCredit()
 				if netcr.LessThanOrEqual(open.value) {
@@ -947,7 +968,8 @@ func dumpChart(records [][]string, ytd bool) {
 	var adjRpl []float64
 	var premium []float64
 	var cash []float64
-	for _, record := range records[2:] {
+	records = records[2:]
+	for i, record := range records {
 		//fmt.Println("----------------------------------->", record)
 		portfolio.AddTransaction(record)
 		//portfolio.PrintStats()
@@ -955,7 +977,15 @@ func dumpChart(records [][]string, ytd bool) {
 		if err != nil {
 			glog.Fatalf("record #%d, bad transaction date: %s", len(portfolio.transactions), err)
 		}
-		// TODO: if date is the same as the previous transaction, coalesce.
+		// If we have multiple transactions at exactly the same time (common with rolls
+		// and options expiration etc), keep processing transactions until we have a
+		// time change so that we have only one data point per timestamp.
+		if i != len(records)-1 {
+			nextDate, err := time.Parse(almostRFC3339, records[i+1][0])
+			if err == nil && date.Equal(nextDate) {
+				continue
+			}
+		}
 		amount, _ := portfolio.rpl.Float64()
 		xv = append(xv, date)
 		rpl = append(rpl, amount)

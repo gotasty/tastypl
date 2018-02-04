@@ -69,6 +69,8 @@ type transaction struct {
 	rpl decimal.Decimal
 	// Opening transaction from which the realized P&L was made.
 	// Only really meaningful for closing transactions.
+	// Exception: for equity trades resulting from options assignment/exercise,
+	// this points to the trade of the option's assignment exercise.
 	openTx *transaction
 }
 
@@ -104,9 +106,6 @@ var (
 	finraTAF = decimal.New(2, -3) // -0.002
 	// SEC Regulatory Fee (on notional amount, only for sales, rounded up)
 	secFee = decimal.New(231, -7) // -0.0000231
-
-	// Commission paid on assignment
-	assignmentFee = decimal.New(-5, 0) // -5.00
 )
 
 func roundUp(d decimal.Decimal) decimal.Decimal {
@@ -247,10 +246,6 @@ type portfolio struct {
 	rplPerUnderlying map[string]decimal.Decimal
 
 	numTrades uint16 // Number of trades executed
-
-	// Number of times we got assigned.
-	assigned uint16
-	assTotal decimal.Decimal
 }
 
 func NewPortfolio(records [][]string, ytd bool) *portfolio {
@@ -269,7 +264,7 @@ func NewPortfolio(records [][]string, ytd bool) *portfolio {
 	p.parseTransactions(records)
 
 	var prevTime time.Time
-	for _, tx := range p.transactions {
+	for i, tx := range p.transactions {
 		if prevTime.After(tx.date) {
 			glog.Fatalf("transaction log out of order at time %s (tx=%s)", tx.date, tx)
 		} else if tx.date.Sub(prevTime) > rollWindow && len(p.recentTx) > 0 {
@@ -279,6 +274,44 @@ func NewPortfolio(records [][]string, ytd bool) *portfolio {
 			p.recentTx = make(map[recentKey][]*transaction)
 		}
 		prevTime = tx.date
+		// When we are handling an assignment or exercise, the transaction in the
+		// underlying can appear either before or after the transaction that retires the
+		// option position.  This is problematic for us, because we need to adjut the
+		// cost basis or P&L by the amount of the premium, so we need to tie together
+		// the two transactions somehow.  Work around this inconsistency in the CSV by
+		// detecting assignment/exercise transaction pairs and making the option
+		// transaction point to the equity transaction.
+		if tx.txType == "Receive Deliver" && i != len(p.transactions)-1 {
+			nextTx := p.transactions[i+1]
+			if nextTx.txType == "Receive Deliver" &&
+				tx.date.Equal(nextTx.date) {
+				var op *transaction
+				var buy bool
+				if tx.option {
+					op = tx
+					buy = nextTx.long
+				} else if nextTx.option {
+					op = nextTx
+					buy = tx.long
+				}
+				shares := op.quantity.Mul(decimal.New(int64(op.multiplier), 0))
+				price := op.strike.Mul(shares)
+				if buy {
+					price = price.Neg()
+				}
+				if tx.openTx == nil && tx.action == "" &&
+					nextTx.action != "" && tx.underlying == nextTx.symbol &&
+					nextTx.quantity.Equal(shares) && nextTx.value.Equal(price) {
+					// First case: option transaction appears before equity transaction.
+					tx.openTx = nextTx
+				} else if nextTx.openTx == nil && tx.action != "" &&
+					nextTx.action == "" && tx.symbol == nextTx.underlying &&
+					tx.quantity.Equal(shares) && tx.value.Equal(price) {
+					// Second case: equity transaction appears before option transaction.
+					nextTx.openTx = tx
+				}
+			}
+		}
 		p.handleTransaction(tx)
 	}
 	return p
@@ -372,8 +405,9 @@ func (p *portfolio) parseTransaction(i int, rec []string, ytd *bool) *transactio
 	if fees.GreaterThan(decimal.Zero) {
 		glog.Fatalf("record #%d, positive fees amount %s", i, rec[10])
 	}
-	instrument := rec[4]
 	p.cash = p.cash.Add(value).Add(comm).Add(fees)
+	txType := rec[1]
+	instrument := rec[4]
 	var call bool
 	var mtm bool
 	option := true
@@ -383,15 +417,18 @@ func (p *portfolio) parseTransaction(i int, rec []string, ytd *bool) *transactio
 		call = true
 	case "":
 		// Handle non-trade transactions.
-		if rec[1] != "Trade" {
+		if txType != "Trade" && txType != "Receive Deliver" {
 			// Detect daily mark-to-market of futures held overnight
-			if rec[1] == "Money Movement" && instrument == "Future" &&
+			if txType == "Money Movement" && instrument == "Future" &&
 				strings.HasSuffix(rec[5], "Final settlement price") {
 				mtm = true
 			} else {
 				p.parseNonOptionTransaction(rec)
 				return nil
 			}
+		}
+		if strings.HasSuffix(instrument, "Option") {
+			glog.Fatal("WTF, record #%d should be a non-option transaction: %q", i, rec)
 		}
 		// else: fallthrough (this is a trade but a non-option transaction)
 		option = false
@@ -416,7 +453,7 @@ func (p *portfolio) parseTransaction(i int, rec []string, ytd *bool) *transactio
 	qty := parseDecimal(rec[7])
 	tx := &transaction{
 		date:        date,
-		txType:      rec[1],
+		txType:      txType,
 		action:      action,
 		symbol:      rec[3],
 		instrument:  instrument,
@@ -449,6 +486,81 @@ func (p *portfolio) parseTransaction(i int, rec []string, ytd *bool) *transactio
 	return tx
 }
 
+func (p *portfolio) handleTrade(tx *transaction, count bool) {
+	switch tx.action {
+	case "SELL_TO_OPEN", "BUY_TO_OPEN":
+		p.openPosition(tx)
+		p.detectRoll(tx)
+	case "SELL_TO_CLOSE", "BUY_TO_CLOSE":
+		p.closePosition(tx, count)
+		p.detectRoll(tx)
+	default:
+		if tx.instrument == "Future" {
+			// TODO check what happens for equities
+			if tx.value.Equal(decimal.Zero) { // Open
+				p.openPosition(tx)
+			} else { // Settle
+				p.closePosition(tx, count)
+			}
+		} else {
+			glog.Fatalf("Unhandled action type %q in %s %#v", tx.action, tx, tx)
+		}
+	}
+}
+
+func (p *portfolio) handleAssignmentOrExercise(tx *transaction, count bool) {
+	expired := strings.HasSuffix(tx.description, "due to expiration.")
+	if !expired {
+		// Trade caused by an assignment or exercise.
+		// We get two entries per position: one to tell us the position
+		// expired and was assigned/exercised, and one with the transaction
+		// in the underlying equity.
+		if tx.action != "" {
+			p.handleTrade(tx, count)
+			return
+		}
+	}
+	// We can't use closePosition() here because we don't know whether
+	// we're closing a long or a short position.  So the best we can
+	// do is just close all positions for this symbol.  In theory, if
+	// we held both long and short positions for the same option, that
+	// would be problematic, in practice however I don't believe that's
+	// possible on TW.
+	pos, ok := p.positions[tx.symbol]
+	if !ok {
+		glog.Fatalf("Couldn't find an opening transaction for %s", tx)
+	}
+	quantity := tx.quantity.Abs() // clone
+	for _, open := range pos.opens {
+		glog.V(3).Infof("position %s expired by %s", open, tx)
+		p.premium = p.premium.Sub(open.value)
+		tx.rpl = open.value
+		quantity = quantity.Sub(open.quantity)
+		if expired {
+			if count {
+				p.recordPL(open, open.value)
+			}
+			tx.openTx = open
+		} else {
+			// Adjust the cost basis of the underlying position by the amount of
+			// premium in the original option position.
+			if tx.openTx.open {
+				glog.V(3).Infof("Adjusting cost basis of %s by %s", tx.openTx, open.value)
+				tx.openTx.rpl = open.value
+			} else {
+				glog.V(3).Infof("Adjusting realized P&L of %s by %s", tx.openTx, open.value)
+				if count {
+					p.recordPL(tx.openTx, open.value)
+				}
+			}
+		}
+	}
+	if !quantity.Equal(decimal.Zero) {
+		glog.Fatalf("Left with %d position after handling %s", quantity, tx)
+	}
+	delete(p.positions, tx.symbol)
+}
+
 func (p *portfolio) handleTransaction(tx *transaction) {
 	count := !p.ytd || tx.ytd()
 	if count {
@@ -457,65 +569,13 @@ func (p *portfolio) handleTransaction(tx *transaction) {
 	}
 	switch tx.txType {
 	case "Trade":
+		// Increment numTrades here and not in handleTrade because trades
+		// caused by option positions assignments/exercises aren't really
+		// trades per se.
 		p.numTrades++
-		switch tx.action {
-		case "SELL_TO_OPEN", "BUY_TO_OPEN":
-			p.openPosition(tx)
-			p.detectRoll(tx)
-		case "SELL_TO_CLOSE", "BUY_TO_CLOSE":
-			p.closePosition(tx, count)
-			p.detectRoll(tx)
-		default:
-			if tx.instrument == "Future" {
-				// TODO check what happens for equities
-				if tx.value.Equal(decimal.Zero) { // Open
-					p.openPosition(tx)
-				} else { // Settle
-					p.closePosition(tx, count)
-				}
-			} else {
-				glog.Fatalf("Unhandled action type %q in %s %#v", tx.action, tx, tx)
-			}
-		}
+		p.handleTrade(tx, count)
 	case "Receive Deliver":
-		// We can't use closePosition() here because we don't know whether
-		// we're closing a long or a short position.  So the best we can
-		// do is just close all positions for this symbol.  In theory, if
-		// we held both long and short positions for the same option, that
-		// would be problematic, in practice however I don't believe that's
-		// possible on TW.
-		pos, ok := p.positions[tx.symbol]
-		if !ok {
-			glog.Fatalf("Couldn't find an opening transaction for %s", tx)
-		}
-		assigned := strings.HasSuffix(tx.description, "due to assignment")
-		if assigned && count {
-			p.assigned++
-			p.fees = p.fees.Add(assignmentFee)
-		}
-		quantity := tx.quantity.Abs() // clone
-		for _, open := range pos.opens {
-			glog.V(3).Infof("position %s expired by %s", open, tx)
-			p.premium = p.premium.Sub(open.value)
-			tx.openTx = open
-			quantity = quantity.Sub(open.quantity)
-			if assigned {
-				cost := open.strike.Mul(decimal.New(int64(open.multiplier), 0)).Sub(open.value)
-				if count {
-					p.assTotal = p.assTotal.Sub(cost)
-				}
-				tx.rpl = cost
-			} else {
-				if count {
-					p.recordPL(open, open.value)
-				}
-				tx.rpl = open.value
-			}
-		}
-		if !quantity.Equal(decimal.Zero) {
-			glog.Fatalf("Left with %d position after handling %s", quantity, tx)
-		}
-		delete(p.positions, tx.symbol)
+		p.handleAssignmentOrExercise(tx, count)
 	case "Money Movement":
 		// Handle daily mark-to-market settlement of futures
 		if !tx.mtm {
@@ -573,13 +633,21 @@ func (p *portfolio) closePosition(tx *transaction, count bool) {
 			continue
 		}
 		closed := decimal.Min(remaining, open.qtyOpen)
-		p.premium = p.premium.Sub(open.avgPrice.Mul(closed))
+		if tx.option {
+			p.premium = p.premium.Sub(open.avgPrice.Mul(closed))
+		}
 		remaining = remaining.Sub(closed)
 		// Close off this opening transaction.
 		open.qtyOpen = open.qtyOpen.Sub(closed)
 		rpl := open.avgPrice.Add(tx.avgPrice).Mul(closed)
 		glog.V(4).Infof("%s -> %s [%s+%s] ==> realized P&L = %s",
 			open, tx, open.avgPrice, tx.avgPrice, rpl)
+		if !open.option && !open.rpl.Equal(decimal.Zero) {
+			// Special case for positions opened as a result of assignment/exercise:
+			// adjust the P&L by the amount of premium on the original option.
+			rpl = rpl.Add(open.rpl)
+			glog.V(4).Infof("Adjusted realized P&L by %s to %s", open.rpl, rpl)
+		}
 		tx.openTx = open
 		tx.rpl = rpl
 		if count {
@@ -627,7 +695,7 @@ func (p *portfolio) closePosition(tx *transaction, count bool) {
 //      opening transaction.
 func (p *portfolio) detectRoll(tx *transaction) {
 	if !tx.option {
-		glog.Fatalf("non-option transaction can't be a roll: %s", tx)
+		return
 	}
 	qty := tx.quantity.IntPart()
 	if !decimal.New(qty, 0).Equal(tx.quantity) {
@@ -688,6 +756,7 @@ func (p *portfolio) PrintPositions() {
 		for _, open := range pos.opens {
 			underlying := open.underlying
 			if open.instrument == "Future" {
+				// Drop the month and year
 				underlying = underlying[:len(underlying)-2]
 			}
 			pos, ok := perUnderlying[underlying]
@@ -715,7 +784,7 @@ func (p *portfolio) PrintPositions() {
 		if len(pos.opens) > 1 {
 			plural = "s"
 		}
-		fmt.Printf("%-5s(%d position%s)\n", underlying, len(pos.opens), plural)
+		fmt.Printf("%-6s(%d position%s)\n", underlying, len(pos.opens), plural)
 		sort.Slice(pos.opens, func(i, j int) bool {
 			a := pos.opens[i]
 			b := pos.opens[j]
@@ -734,8 +803,15 @@ func (p *portfolio) PrintPositions() {
 			} else {
 				long = "short"
 			}
+			var net string
 			if !open.option {
-				fmt.Printf("  %s\n", open)
+				// If this is an equity position that was opened as a result of an
+				// exercise or assignment, show the adjusted cost basis.
+				if !open.rpl.Equal(decimal.Zero) {
+					net = fmt.Sprintf(" (adj. cost basis %s)",
+						open.value.Add(open.rpl).Neg().Div(open.quantity).StringFixed(2))
+				}
+				fmt.Printf("  %s%s\n", open, net)
 				continue
 			}
 			var expFmt string
@@ -751,7 +827,6 @@ func (p *portfolio) PrintPositions() {
 				call = "put "
 			}
 			mult := decimal.New(int64(open.multiplier), 0)
-			var net string
 			// TODO: Handle transitive rolls
 			if open.rolledFrom != nil {
 				netcr := open.NetCredit()
@@ -796,6 +871,9 @@ func (p *portfolio) PrintStats() {
 	}
 	duration := p.transactions[len(p.transactions)-1].date.Sub(beginTime).Round(day)
 	days := int(duration / day)
+	if days == 0 {
+		days = 1 // Simplify division by zero handling by saying we have at least one day.
+	}
 	pct := func(amount decimal.Decimal) string {
 		if p.rpl.Equal(decimal.Zero) {
 			return "0%"
@@ -812,17 +890,24 @@ func (p *portfolio) PrintStats() {
 	fmt.Printf("Gross P&L:              %8s (~%s/day avg, %s of P&L)\n",
 		grosspl.StringFixed(2),
 		grosspl.Div(decimal.New(int64(days), 0)).StringFixed(2), pct(grosspl))
-	fmt.Printf("Stock assignments:      %8s (%d)\n", p.assTotal.StringFixed(2), p.assigned)
-	fmt.Printf("Adjusted Gross P&L:     %8s\n", grosspl.Add(p.assTotal).StringFixed(2))
-	fmt.Printf("Net ACH movements:      %8s\n", p.ach.StringFixed(2))
 	var premium decimal.Decimal
+	var neq uint                       // Number of equity positions
+	var equity decimal.Decimal         // Cost of equity
+	var equityDiscount decimal.Decimal // Adj. cost basis of equity acquired from options
 	for _, pos := range p.positions {
 		for _, open := range pos.opens {
 			if open.option {
 				premium = premium.Add(open.value)
+			} else if open.instrument != "Future" {
+				equity = equity.Add(open.value)
+				equityDiscount = equityDiscount.Add(open.rpl)
+				neq++
 			}
 		}
 	}
+	fmt.Printf("Equity:                 %8s (%d positions)\n", equity.StringFixed(2), neq)
+	fmt.Printf("Adjusted Gross P&L:     %8s\n", grosspl.Add(equity).StringFixed(2))
+	fmt.Printf("Net ACH movements:      %8s\n", p.ach.StringFixed(2))
 	fmt.Printf("Outstanding premium:    %8s\n", p.premium.StringFixed(2))
 	if !premium.Equal(p.premium) {
 		fmt.Printf("-> Warning: estimated outstanding premium should've been %s (difference: %s)\n",
@@ -831,7 +916,7 @@ func (p *portfolio) PrintStats() {
 	fmt.Printf("Cash on hand:           %8s\n", p.cash.StringFixed(2))
 	if !p.ytd {
 		// Alternative method to compute cash on hand
-		cash := grosspl.Add(premium).Add(p.ach).Add(p.assTotal).Add(p.miscCash)
+		cash := grosspl.Add(premium).Add(p.ach).Add(equity).Add(equityDiscount).Add(p.miscCash)
 		if !cash.Equal(p.cash) {
 			fmt.Printf("-> Warning: estimated cash on hand should've been %s (difference: %s)\n",
 				cash.StringFixed(2), cash.Sub(p.cash).StringFixed(2))
@@ -849,7 +934,7 @@ func (p *portfolio) PrintPL() {
 	}
 	sort.Sort(sort.StringSlice(underlyings))
 	for _, underlying := range underlyings {
-		fmt.Printf("%-5s%8s\n", underlying, p.rplPerUnderlying[underlying].StringFixed(2))
+		fmt.Printf("%-6s%8s\n", underlying, p.rplPerUnderlying[underlying].StringFixed(2))
 	}
 }
 
@@ -870,6 +955,7 @@ func dumpChart(records [][]string, ytd bool) {
 		if err != nil {
 			glog.Fatalf("record #%d, bad transaction date: %s", len(portfolio.transactions), err)
 		}
+		// TODO: if date is the same as the previous transaction, coalesce.
 		amount, _ := portfolio.rpl.Float64()
 		xv = append(xv, date)
 		rpl = append(rpl, amount)

@@ -806,7 +806,15 @@ func (p *portfolio) PrintPositions() {
 		if len(pos.opens) > 1 {
 			plural = "s"
 		}
-		fmt.Printf("%-6s(%d position%s)\n", underlying, len(pos.opens), plural)
+		var rpl string
+		if pl, ok := p.rplPerUnderlying[underlying]; ok {
+			var ytd string
+			if p.ytd {
+				ytd = "YTD "
+			}
+			rpl = fmt.Sprintf(" [%sRPL=%s]", ytd, pl.StringFixed(2))
+		}
+		fmt.Printf("%-6s(%d position%s)%s\n", underlying, len(pos.opens), plural, rpl)
 		sort.Slice(pos.opens, func(i, j int) bool {
 			a := pos.opens[i]
 			b := pos.opens[j]
@@ -849,16 +857,29 @@ func (p *portfolio) PrintPositions() {
 				call = "put "
 			}
 			mult := decimal.New(int64(open.multiplier), 0)
-			if open.rolledFrom != nil {
-				netcr := open.NetCredit()
-				if netcr.LessThanOrEqual(open.value) {
-					net = fmt.Sprintf(", booked loss %s", open.value.Sub(netcr).Div(mult).StringFixed(2))
-				}
-				net = fmt.Sprintf(" (net credit %s%s)", netcr.Div(mult).StringFixed(2), net)
+			// Adjust premium amounts per open contract
+			perContract := func(v decimal.Decimal) string {
+				return v.Div(open.qtyOpen).StringFixed(2)
 			}
-			fmt.Printf("  %s %s %s $%s %s @ %s%s\n",
+			var netcr decimal.Decimal // net credit
+			if open.rolledFrom != nil {
+				netcr = open.NetCredit()
+				if netcr.LessThanOrEqual(open.value) {
+					net = fmt.Sprintf(", booked loss %s", perContract(open.value.Sub(netcr).Div(mult)))
+				}
+				net = fmt.Sprintf(" (net credit %s%s)", perContract(netcr.Div(mult)), net)
+			} else {
+				netcr = open.value
+			}
+			// Break even point = strike + premium for calls, strike - premium for puts.
+			bep := netcr.Div(mult).Div(open.qtyOpen) // Premium per share
+			if !open.call {
+				bep = bep.Neg() // For a put we subtract instead
+			}
+			bep = bep.Add(open.strike)
+			fmt.Printf("  %s %s %s $%s %s @ %s [BEP=%s] %s\n",
 				open.expDate.Format(expFmt), long, open.qtyOpen, open.strike,
-				call, open.value.Div(mult).StringFixed(2), net)
+				call, perContract(open.value.Div(mult)), bep.StringFixed(2), net)
 		}
 	}
 }

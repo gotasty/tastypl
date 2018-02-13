@@ -226,7 +226,7 @@ type portfolio struct {
 	// Transactions older than rollWindow should get purged.
 	recentTx map[recentKey][]*transaction
 
-	ach decimal.Decimal // sum of all ACH movements
+	moneyMov decimal.Decimal // sum of all ACH/wire movements
 
 	// Map of symbol to opening transaction(s)
 	positions map[string]*position
@@ -330,8 +330,8 @@ func (p *portfolio) parseNonOptionTransaction(record []string) {
 		switch record[5] {
 		case "INTEREST ON CREDIT BALANCE":
 			p.intrs = p.intrs.Add(amount)
-		case "ACH DEPOSIT", "ACH DISBURSEMENT":
-			p.ach = p.ach.Add(amount)
+		case "ACH DEPOSIT", "ACH DISBURSEMENT", "Wire Funds Received":
+			p.moneyMov = p.moneyMov.Add(amount)
 		default:
 			if strings.HasPrefix(record[5], "FROM ") {
 				// Interest paid, e.g. "FROM 10/16 THRU 11/15 @ 8    %"
@@ -405,7 +405,7 @@ func (p *portfolio) parseTransaction(i int, rec []string, ytd *bool) *transactio
 		// Reset running counts as we only want YTD numbers.
 		p.miscCash = decimal.Zero
 		p.intrs = decimal.Zero
-		p.ach = decimal.Zero
+		p.moneyMov = decimal.Zero
 		// Note: we don't reset p.cash as the only way to have the correct
 		// amount of cash ultimately in the account is of course to take
 		// into account (bad pun, sorry) the entire account history.
@@ -872,7 +872,7 @@ func (p *portfolio) PrintPositions() {
 				netcr = open.value
 			}
 			// Break even point = strike + premium for calls, strike - premium for puts.
-			bep := netcr.Div(mult).Div(open.qtyOpen) // Premium per share
+			bep := netcr.Abs().Div(mult).Div(open.qtyOpen) // Premium per share
 			if !open.call {
 				bep = bep.Neg() // For a put we subtract instead
 			}
@@ -949,7 +949,7 @@ func (p *portfolio) PrintStats() {
 	}
 	fmt.Printf("Equity:                 %8s (%d positions)\n", equity.StringFixed(2), neq)
 	fmt.Printf("Adjusted Gross P&L:     %8s\n", grosspl.Add(equity).StringFixed(2))
-	fmt.Printf("Net ACH movements:      %8s\n", p.ach.StringFixed(2))
+	fmt.Printf("Net money movements:    %8s\n", p.moneyMov.StringFixed(2))
 	fmt.Printf("Outstanding premium:    %8s\n", p.premium.StringFixed(2))
 	if !premium.Equal(p.premium) {
 		fmt.Printf("-> Warning: estimated outstanding premium should've been %s (difference: %s)\n",
@@ -958,7 +958,7 @@ func (p *portfolio) PrintStats() {
 	fmt.Printf("Cash on hand:           %8s\n", p.cash.StringFixed(2))
 	if !p.ytd {
 		// Alternative method to compute cash on hand
-		cash := grosspl.Add(premium).Add(p.ach).Add(equity).Add(equityDiscount).Add(p.miscCash)
+		cash := grosspl.Add(premium).Add(p.moneyMov).Add(equity).Add(equityDiscount).Add(p.miscCash)
 		if !cash.Equal(p.cash) {
 			fmt.Printf("-> Warning: estimated cash on hand should've been %s (difference: %s)\n",
 				cash.StringFixed(2), cash.Sub(p.cash).StringFixed(2))

@@ -210,7 +210,6 @@ const rollWindow = 30 * time.Second
 // Used to track recent transactions to detect rolls (for options only).
 type recentKey struct {
 	underlying string
-	quantity   uint8
 	call       bool // or put if false
 	long       bool // or short if false
 	open       bool // or closing transaction if false.
@@ -728,7 +727,6 @@ func (p *portfolio) detectRoll(tx *transaction) {
 	// Look for an earlier transaction that could make up a roll.
 	key := recentKey{
 		underlying: tx.underlying, // Look for the same underlying
-		quantity:   uint8(qty),    // and same number of contracts
 		call:       tx.call,       // and same type of option (both puts or both calls)
 		long:       !tx.long,      // but opposite side of the market
 		open:       !tx.open,      // and opening if we're closing or vice versa

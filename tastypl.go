@@ -824,7 +824,8 @@ func (p *portfolio) PrintPositions() {
 			// Same exp date, break tie by strike.
 			return a.strike.LessThan(b.strike)
 		})
-		for _, open := range pos.opens {
+		var prevUsed bool // true if the previous leg was included as part of a multi-leg position.
+		for i, open := range pos.opens {
 			var long string
 			if open.long {
 				long = "long "
@@ -852,7 +853,7 @@ func (p *portfolio) PrintPositions() {
 			if open.call {
 				call = "call"
 			} else {
-				call = "put "
+				call = "put"
 			}
 			mult := decimal.New(int64(open.multiplier), 0)
 			// Adjust premium amounts per open contract
@@ -875,9 +876,55 @@ func (p *portfolio) PrintPositions() {
 				bep = bep.Neg() // For a put we subtract instead
 			}
 			bep = bep.Add(open.strike)
-			fmt.Printf("  %s %s %s $%s %s @ %s [BEP=%s] %s\n",
+			fmt.Printf("  %s %s %s $%s %-4s @ %s [BEP=%s] %s\n",
 				open.expDate.Format(expFmt), long, open.qtyOpen, open.strike,
 				call, perContract(open.value.Div(mult)), bep.StringFixed(2), net)
+
+			// Lame-ass attempt to detect two-leg positions.
+			if i == 0 {
+				continue
+			}
+			if prevUsed {
+				prevUsed = false
+				continue
+			}
+			prev := pos.opens[i-1]
+			sameExpiration := prev.expDate.Equal(open.expDate)
+			sameQty := prev.qtyOpen.Equal(open.qtyOpen)
+
+			if prev.rolledFrom != nil || open.rolledFrom != nil {
+				prevNetCr := prev.NetCredit()
+				thisNetCr := open.NetCredit()
+				netcr = prevNetCr.Add(thisNetCr)
+			} else {
+				netcr = prev.value.Add(open.value)
+			}
+			credit := "credit"
+			if netcr.LessThan(decimal.Zero) {
+				credit = "debit"
+			}
+
+			// We know positions are sorted by expiration and then by strike so if
+			// we have a spread or strangle or straddle it's very likely that the
+			// previous position is the other leg of this two-leg position.
+			// This approach is very hackish and not reliable but should work mostly
+			// fine for simpler portfolios for now.
+			if prev.long != open.long && prev.call == open.call && sameExpiration && sameQty {
+				fmt.Printf("  --> %s/%s %s spread @ %s net %s\n",
+					prev.strike, open.strike, call, perContract(netcr.Div(mult)), credit)
+				prevUsed = true
+			} else if prev.long == open.long && prev.call != open.call && sameExpiration && sameQty {
+				// Strangle or straddle
+				var position string
+				if prev.strike.Equal(open.strike) {
+					position = fmt.Sprintf("%s straddle", open.strike)
+				} else {
+					position = fmt.Sprintf("%s/%s strangle", prev.strike, open.strike)
+				}
+				fmt.Printf("  --> %s @ %s net %s\n",
+					position, perContract(netcr.Div(mult)), credit)
+				prevUsed = true
+			}
 		}
 	}
 }

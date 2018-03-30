@@ -1065,18 +1065,40 @@ func dumpChart(records [][]string, ytd bool) {
 	}
 
 	graph := chart.Chart{
+		Width:  1400,
+		Height: 700,
 		XAxis: chart.XAxis{
 			Style:          chart.StyleShow(),
-			TickPosition:   chart.TickPositionBetweenTicks,
-			ValueFormatter: chart.TimeHourValueFormatter,
+			TickPosition:   chart.TickPositionUnderTick,
+			ValueFormatter: chart.TimeValueFormatterWithFormat("Jan 2 '06"),
 			Range: &chart.MarketHoursRange{
 				MarketOpen:      util.NYSEOpen(),
 				MarketClose:     util.NYSEClose(),
 				HolidayProvider: util.Date.IsNYSEHoliday,
 			},
+			GridMajorStyle: chart.Style{
+				Show:        true,
+				StrokeColor: chart.ColorLightGray,
+				StrokeWidth: 1.0,
+			},
+			GridMinorStyle: chart.Style{
+				Show:        true,
+				StrokeColor: chart.ColorLightGray,
+				StrokeWidth: 1.0,
+			},
 		},
 		YAxis: chart.YAxis{
 			Style: chart.StyleShow(),
+			GridMajorStyle: chart.Style{
+				Show:        true,
+				StrokeColor: chart.ColorLightGray,
+				StrokeWidth: 1.0,
+			},
+			GridMinorStyle: chart.Style{
+				Show:        true,
+				StrokeColor: chart.ColorLightGray,
+				StrokeWidth: 1.0,
+			},
 		},
 		Series: []chart.Series{
 			chart.TimeSeries{
@@ -1084,7 +1106,7 @@ func dumpChart(records [][]string, ytd bool) {
 				XValues: xv,
 				YValues: rpl,
 				Style: chart.Style{
-					StrokeDashArray: []float64{5.0, 5.0},
+					StrokeDashArray: []float64{3.0, 3.0},
 				},
 			},
 			chart.TimeSeries{

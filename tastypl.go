@@ -160,10 +160,18 @@ func (t *transaction) sanityCheck() {
 	}
 	// Recompute OCC symbol and ensure what we have is the same
 	// See https://www.theocc.com/components/docs/initiatives/symbology/symbology_initiative_v1_8.pdf
-	symbol := fmt.Sprintf("%- 6s%s%c%08d", t.underlying, t.expDate.Format("060102"), cp,
-		t.strike.Mul(oneThousand).IntPart())
+	strike := t.strike.Mul(oneThousand).IntPart()
+	expDate := t.expDate.Format("060102")
+	const symfmt = "%- 6s%s%c%08d"
+	symbol := fmt.Sprintf(symfmt, t.underlying, expDate, cp, strike)
 	if symbol != t.symbol {
-		glog.Fatalf("expected symbol %q but found %q in %s", symbol, t.symbol, t)
+		// PM-settled index options have an additional "P" in the symbol.
+		// This is a hack to accept those.
+		pm := t.underlying + "P"
+		symbol = fmt.Sprintf(symfmt, pm, expDate, cp, strike)
+		if symbol != t.symbol {
+			glog.Fatalf("expected symbol %q but found %q in %s", symbol, t.symbol, t)
+		}
 	}
 }
 

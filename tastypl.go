@@ -255,7 +255,7 @@ type portfolio struct {
 	numTrades uint16 // Number of trades executed
 }
 
-func NewPortfolio(records [][]string, ytd bool) *portfolio {
+func NewPortfolio(records [][]string, ytd bool, nofutures bool) *portfolio {
 	p := &portfolio{
 		ytd:              ytd,
 		positions:        make(map[string]*position),
@@ -268,7 +268,7 @@ func NewPortfolio(records [][]string, ytd bool) *portfolio {
 		opp := len(records) - 1 - i
 		records[i], records[opp] = records[opp], records[i]
 	}
-	p.parseTransactions(records)
+	p.parseTransactions(records, nofutures)
 
 	var prevTime time.Time
 	for i, tx := range p.transactions {
@@ -387,12 +387,15 @@ func (p *portfolio) AddTransaction(record []string) {
 
 // parseTransactions parses raw transactions from the CSV and adds them to the
 // transaction history.
-func (p *portfolio) parseTransactions(records [][]string) {
+func (p *portfolio) parseTransactions(records [][]string, nofutures bool) {
 	p.transactions = make([]*transaction, len(records))
 	var j int
 	ytd := p.ytd
 	for i, rec := range records {
 		if tx := p.parseTransaction(i, rec, &ytd); tx != nil {
+			if nofutures && tx.instrument == "Future" {
+				continue
+			}
 			p.transactions[j] = tx
 			j++
 		}
@@ -927,7 +930,14 @@ func (p *portfolio) PrintPositions() {
 				if prev.strike.Equal(open.strike) {
 					position = fmt.Sprintf("%s straddle", open.strike)
 				} else {
-					position = fmt.Sprintf("%s/%s strangle", prev.strike, open.strike)
+					if prev.call {
+						prev, open = open, prev // always list the put before the call
+					}
+					var inverted string
+					if prev.strike.GreaterThan(open.strike) {
+						inverted = fmt.Sprintf("inverted [%s wide] ", prev.strike.Sub(open.strike))
+					}
+					position = fmt.Sprintf("%s/%s %sstrangle", prev.strike, open.strike, inverted)
 				}
 				fmt.Printf("  --> %s @ %s net %s\n",
 					position, perContract(netcr.Div(mult)), credit)
@@ -1033,10 +1043,10 @@ func (p *portfolio) PrintPL() {
 	}
 }
 
-func dumpChart(records [][]string, ytd bool) {
+func dumpChart(records [][]string, ytd bool, nofutures bool) {
 	// We don't really have a good way to track stats step by step, so rebuild the
 	// portfolio by adding the transactions one by one for now.
-	portfolio := NewPortfolio(records[1:2], ytd) // Just the first transaction
+	portfolio := NewPortfolio(records[1:2], ytd, nofutures) // Just the first transaction
 	var xv []time.Time
 	var rpl []float64
 	var adjRpl []float64
@@ -1045,6 +1055,9 @@ func dumpChart(records [][]string, ytd bool) {
 	records = records[2:]
 	for i, record := range records {
 		//fmt.Println("----------------------------------->", record)
+		if nofutures && record[4] == "Future" {
+			continue
+		}
 		portfolio.AddTransaction(record)
 		//portfolio.PrintStats()
 		date, err := time.Parse(almostRFC3339, record[0])
@@ -1153,6 +1166,7 @@ func main() {
 	printPL := flag.Bool("printpl", false, "print realized P&L per underlying")
 	positions := flag.Bool("positions", false, "print current positions")
 	chart := flag.Bool("chart", false, "create a chart of P&L")
+	nofutures := flag.Bool("nofutures", false, "ignore all futures transactions")
 	flag.Parse()
 	if *input == "" {
 		glog.Fatal("-input flag required")
@@ -1165,7 +1179,7 @@ func main() {
 		glog.Fatal("CSV seems malformed")
 	}
 
-	portfolio := NewPortfolio(records[1:], *ytd)
+	portfolio := NewPortfolio(records[1:], *ytd, *nofutures)
 	if *stats {
 		portfolio.PrintStats()
 	}
@@ -1173,7 +1187,7 @@ func main() {
 		portfolio.PrintPL()
 	}
 	if *chart {
-		dumpChart(records, *ytd)
+		dumpChart(records, *ytd, *nofutures)
 	}
 	if *positions {
 		portfolio.PrintPositions()

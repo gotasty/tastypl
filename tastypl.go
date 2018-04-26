@@ -851,7 +851,7 @@ func (p *portfolio) PrintPositions() {
 					net = fmt.Sprintf(" (adj. cost basis %s)",
 						open.value.Add(open.rpl).Neg().Div(open.quantity).StringFixed(2))
 				}
-				fmt.Printf("  %s%s\n", open, net)
+				fmt.Printf("  %s %s shares @ %s%s\n", long, open.qtyOpen, open.avgPrice.Abs().StringFixed(2), net)
 				continue
 			}
 			var expFmt string

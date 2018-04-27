@@ -555,27 +555,31 @@ func (p *portfolio) handleAssignmentOrExercise(tx *transaction, count bool) {
 	if !ok {
 		glog.Fatalf("Couldn't find an opening transaction for %s", tx)
 	}
-	quantity := tx.quantity.Abs() // clone
+	remaining := tx.quantity.Abs() // clone
 	for _, open := range pos.opens {
 		glog.V(3).Infof("position %s expired by %s", open, tx)
-		p.premium = p.premium.Sub(open.value)
-		tx.rpl = open.value
-		quantity = quantity.Sub(open.quantity)
+		closed := decimal.Min(remaining, open.qtyOpen)
+		premium := open.avgPrice.Mul(closed) // Amount of premium of assigned position
+		p.premium = p.premium.Sub(premium)
+		tx.rpl = premium
+		remaining = remaining.Sub(closed)
+		// Close off this opening transaction.
+		open.qtyOpen = open.qtyOpen.Sub(closed)
 		if expired {
 			if count {
-				p.recordPL(open, open.value)
+				p.recordPL(open, premium)
 			}
 			tx.openTx = open
 		} else if tx.openTx != nil {
 			// Adjust the cost basis of the underlying position by the amount of
 			// premium in the original option position.
 			if tx.openTx.open {
-				glog.V(3).Infof("Adjusting cost basis of %s by %s", tx.openTx, open.value)
-				tx.openTx.rpl = open.value
+				glog.V(3).Infof("Adjusting cost basis of %s by %s", tx.openTx, premium)
+				tx.openTx.rpl = premium
 			} else {
-				glog.V(3).Infof("Adjusting realized P&L of %s by %s", tx.openTx, open.value)
+				glog.V(3).Infof("Adjusting realized P&L of %s by %s", tx.openTx, premium)
 				if count {
-					p.recordPL(tx.openTx, open.value)
+					p.recordPL(tx.openTx, premium)
 				}
 			}
 		} else {
@@ -584,13 +588,37 @@ func (p *portfolio) handleAssignmentOrExercise(tx *transaction, count bool) {
 			// separately here (rather than trying to adjust the cost basis / P&L in the
 			// underlying).  We need this to properly compute P&L when adding transactions
 			// incrementally with AddTransaction().
-			p.recordPL(open, open.value)
+			p.recordPL(open, premium)
 		}
 	}
-	if !quantity.Equal(decimal.Zero) {
-		glog.Fatalf("Left with %d position after handling %s", quantity, tx)
+	if !remaining.Equal(decimal.Zero) {
+		glog.Fatalf("Left with %s position after handling %s", remaining, tx)
 	}
-	delete(p.positions, tx.symbol)
+	p.purgeClosed(tx, pos)
+}
+
+// Purge closed positions from our portfolio.
+func (p *portfolio) purgeClosed(tx *transaction, pos *position) {
+	var stillOpen int
+	for _, open := range pos.opens {
+		if !open.qtyOpen.Equal(decimal.Zero) {
+			stillOpen += 1
+		}
+	}
+	if stillOpen == 0 { // No position left for this underlying.
+		delete(p.positions, tx.symbol) // Clear it out completely.
+	} else {
+		// Ditch the opening transactions that are fully closed, keep the rest.
+		opens := make([]*transaction, stillOpen)
+		var j int
+		for _, open := range pos.opens {
+			if !open.qtyOpen.Equal(decimal.Zero) {
+				opens[j] = open
+				j++
+			}
+		}
+		pos.opens = opens
+	}
 }
 
 func (p *portfolio) handleTransaction(tx *transaction) {
@@ -669,17 +697,18 @@ func (p *portfolio) closePosition(tx *transaction, count bool) {
 			p.premium = p.premium.Sub(open.avgPrice.Mul(closed))
 		}
 		remaining = remaining.Sub(closed)
-		// Close off this opening transaction.
-		open.qtyOpen = open.qtyOpen.Sub(closed)
 		rpl := open.avgPrice.Add(tx.avgPrice).Mul(closed)
 		glog.V(4).Infof("%s -> %s [%s+%s] ==> realized P&L = %s",
 			open, tx, open.avgPrice, tx.avgPrice, rpl)
 		if !open.option && !open.rpl.Equal(decimal.Zero) {
 			// Special case for positions opened as a result of assignment/exercise:
 			// adjust the P&L by the amount of premium on the original option.
-			rpl = rpl.Add(open.rpl)
-			glog.V(4).Infof("Adjusted realized P&L by %s to %s", open.rpl, rpl)
+			adj := open.rpl.Div(open.qtyOpen).Mul(closed)
+			rpl = rpl.Add(adj)
+			glog.V(4).Infof("Adjusted realized P&L by %s to %s", adj, rpl)
 		}
+		// Close off this opening transaction.
+		open.qtyOpen = open.qtyOpen.Sub(closed)
 		tx.openTx = open
 		tx.rpl = rpl
 		if count {
@@ -695,26 +724,7 @@ func (p *portfolio) closePosition(tx *transaction, count bool) {
 	if !remaining.Equal(decimal.Zero) {
 		glog.Fatalf("couldn't close %s contracts in %s", remaining, tx)
 	}
-	// Purge closed positions.
-	var stillOpen int
-	for _, open := range pos.opens {
-		if !open.qtyOpen.Equal(decimal.Zero) {
-			stillOpen += 1
-		}
-	}
-	if stillOpen == 0 {
-		delete(p.positions, tx.symbol)
-	} else {
-		opens := make([]*transaction, stillOpen)
-		var j int
-		for _, open := range pos.opens {
-			if !open.qtyOpen.Equal(decimal.Zero) {
-				opens[j] = open
-				j++
-			}
-		}
-		pos.opens = opens
-	}
+	p.purgeClosed(tx, pos)
 }
 
 // Detect rolled options position.  We consider two transactions to make up a
@@ -889,7 +899,7 @@ func (p *portfolio) PrintPositions() {
 			bep = bep.Add(open.strike)
 			fmt.Printf("  %s %s %s $%s %-4s @ %s [BEP=%s] %s\n",
 				open.expDate.Format(expFmt), long, open.qtyOpen, open.strike,
-				call, perContract(open.value.Div(mult)), bep.StringFixed(2), net)
+				call, open.avgPrice.Div(mult), bep.StringFixed(2), net)
 
 			// Lame-ass attempt to detect two-leg positions.
 			if i == 0 {
@@ -1002,10 +1012,12 @@ func (p *portfolio) PrintStats() {
 	for _, pos := range p.positions {
 		for _, open := range pos.opens {
 			if open.option {
-				premium = premium.Add(open.value)
+				premium = premium.Add(open.avgPrice.Mul(open.qtyOpen))
 			} else if open.instrument != "Future" {
-				equity = equity.Add(open.value)
-				equityDiscount = equityDiscount.Add(open.rpl)
+				// Adjust for the number of shares actually still open
+				scale := open.qtyOpen.Div(open.quantity)
+				equity = equity.Add(open.value).Mul(scale)
+				equityDiscount = equityDiscount.Add(open.rpl).Mul(scale)
 				neq++
 			}
 		}

@@ -861,7 +861,25 @@ func (p *portfolio) PrintPositions() {
 					net = fmt.Sprintf(" (adj. cost basis %s)",
 						open.value.Add(open.rpl).Neg().Div(open.quantity).StringFixed(2))
 				}
-				fmt.Printf("  %s %s shares @ %s%s\n", long, open.qtyOpen, open.avgPrice.Abs().StringFixed(2), net)
+				var kind string
+				var openPrice decimal.Decimal
+				if open.instrument == "Future" {
+					kind = "contract"
+					// Parse the open price from the description :-/
+					p := open.description[strings.IndexByte(open.description, '@')+2:]
+					var err error
+					openPrice, err = decimal.NewFromString(p)
+					if err != nil {
+						glog.Fatal("Can't parse opening price of futures transaction %s: %s", open, err)
+					}
+				} else {
+					kind = "share"
+					openPrice = open.avgPrice.Abs()
+				}
+				if open.qtyOpen.GreaterThan(decimal.New(1, 0)) {
+					kind += "s"
+				}
+				fmt.Printf("  %s %s %s @ %s%s\n", long, open.qtyOpen, kind, openPrice.StringFixed(2), net)
 				continue
 			}
 			var expFmt string

@@ -1181,7 +1181,7 @@ func dumpChart(records [][]string, ytd bool, nofutures bool) {
 		chart.Legend(&graph),
 	}
 
-	rplPng, err := os.Create("/tmp/rpl.png")
+	rplPng, err := os.Create("rpl.png")
 	if err != nil {
 		glog.Fatal(err)
 	}

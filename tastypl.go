@@ -445,7 +445,8 @@ func (p *portfolio) parseTransaction(i int, rec []string, ytd *bool) *transactio
 		if txType != "Trade" && txType != "Receive Deliver" {
 			// Detect daily mark-to-market of futures held overnight
 			if txType == "Money Movement" && instrument == "Future" &&
-				strings.HasSuffix(rec[5], "Final settlement price") {
+				(strings.HasSuffix(rec[5], "Final settlement price") ||
+					strings.HasSuffix(rec[5], "Preliminary settlement price")) {
 				mtm = true
 			} else {
 				p.parseNonOptionTransaction(rec)

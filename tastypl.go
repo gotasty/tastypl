@@ -593,7 +593,7 @@ func (p *portfolio) handleAssignmentOrExercise(tx *transaction, count bool) {
 		}
 	}
 	if !remaining.Equal(decimal.Zero) {
-		glog.Fatalf("Left with %s position after handling %s", remaining, tx)
+		p.synthesizeOpeningTransaction(tx, remaining)
 	}
 	p.purgeClosed(tx, pos)
 }
@@ -723,9 +723,39 @@ func (p *portfolio) closePosition(tx *transaction, count bool) {
 		glog.V(3).Infof("not done handling %s after closing %s", tx, open)
 	}
 	if !remaining.Equal(decimal.Zero) {
-		glog.Fatalf("couldn't close %s contracts in %s", remaining, tx)
+		p.synthesizeOpeningTransaction(tx, remaining)
 	}
 	p.purgeClosed(tx, pos)
+}
+
+// When we close more than what we had open, we need to open the remainder on
+// the opposite side of the market (e.g. long 100 shares, sell to close 200 =>
+// now short 100).
+// This helper synthesizes an opening order for the remaining quantity.
+func (p *portfolio) synthesizeOpeningTransaction(tx *transaction, remaining decimal.Decimal) {
+	// Only allow spilling over stock/futures at this time.
+	if tx.option {
+		panic("not supported yet") // TODO: adjust premium maybe?
+	}
+	otx := *tx               // Copy the original transaction.
+	otx.quantity = remaining // Carry over what's left only.
+	otx.qtyOpen = remaining
+	otx.avgPrice = otx.avgPrice.Neg()
+	otx.value = otx.avgPrice.Mul(remaining)
+	otx.openTx = tx         // Link synthesized transaction to the closing one.
+	otx.fees = decimal.Zero // Synthesized transaction so no fees ..
+	var action string
+	if otx.long {
+		action = "buy"
+	} else {
+		action = "short"
+	}
+	otx.description = fmt.Sprintf("(synthesized) %s to open %s %s @ %s",
+		action, remaining, otx.symbol, otx.avgPrice)
+	otx.commission = decimal.Zero // .. and no commissions, since it's made up.
+	glog.V(2).Infof("left with %s remaining after closing %s -> synthesized opening %s",
+		remaining, tx, &otx)
+	p.openPosition(&otx)
 }
 
 // Detect rolled options position.  We consider two transactions to make up a

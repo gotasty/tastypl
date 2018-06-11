@@ -271,6 +271,13 @@ func NewPortfolio(records [][]string, ytd bool, nofutures bool) *portfolio {
 	p.parseTransactions(records, nofutures)
 
 	var prevTime time.Time
+	var prevRPL decimal.Decimal
+	logDailyRPL := func() {
+		if dpl := p.rpl.Sub(prevRPL); !dpl.Equal(decimal.Zero) {
+			glog.V(4).Infof("Day P/L realized for %s: %s", prevTime.Format("01/02/06"), dpl)
+			prevRPL = p.rpl
+		}
+	}
 	for i, tx := range p.transactions {
 		if prevTime.After(tx.date) {
 			glog.Fatalf("transaction log out of order at time %s (tx=%s)", tx.date, tx)
@@ -279,6 +286,9 @@ func NewPortfolio(records [][]string, ytd bool, nofutures bool) *portfolio {
 			// clear our map of recent transactions as we can't possibly find
 			// any rolls in it anymore.
 			p.recentTx = make(map[recentKey][]*transaction)
+		}
+		if prevTime.YearDay() != tx.date.YearDay() {
+			logDailyRPL()
 		}
 		prevTime = tx.date
 		// When we are handling an assignment or exercise, the transaction in the
@@ -294,6 +304,7 @@ func NewPortfolio(records [][]string, ytd bool, nofutures bool) *portfolio {
 		}
 		p.handleTransaction(tx)
 	}
+	logDailyRPL()
 	return p
 }
 
@@ -558,11 +569,11 @@ func (p *portfolio) handleAssignmentOrExercise(tx *transaction, count bool) {
 	}
 	remaining := tx.quantity.Abs() // clone
 	for _, open := range pos.opens {
-		glog.V(3).Infof("position %s expired by %s", open, tx)
 		closed := decimal.Min(remaining, open.qtyOpen)
 		premium := open.avgPrice.Mul(closed) // Amount of premium of assigned position
 		p.premium = p.premium.Sub(premium)
 		tx.rpl = premium
+		glog.V(3).Infof("position %s expired by %s ==> realized P&L = %s", open, tx, premium)
 		remaining = remaining.Sub(closed)
 		// Close off this opening transaction.
 		open.qtyOpen = open.qtyOpen.Sub(closed)

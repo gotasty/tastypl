@@ -751,7 +751,6 @@ func (p *portfolio) synthesizeOpeningTransaction(tx *transaction, remaining deci
 	otx := *tx               // Copy the original transaction.
 	otx.quantity = remaining // Carry over what's left only.
 	otx.qtyOpen = remaining
-	otx.avgPrice = otx.avgPrice.Neg()
 	otx.value = otx.avgPrice.Mul(remaining)
 	otx.openTx = tx         // Link synthesized transaction to the closing one.
 	otx.fees = decimal.Zero // Synthesized transaction so no fees ..
@@ -761,8 +760,11 @@ func (p *portfolio) synthesizeOpeningTransaction(tx *transaction, remaining deci
 	} else {
 		action = "short"
 	}
+	otx.action = strings.Replace(otx.action, "CLOSE", "OPEN", 1)
+	otx.open = true
 	otx.description = fmt.Sprintf("(synthesized) %s to open %s %s @ %s",
 		action, remaining, otx.symbol, otx.avgPrice)
+	otx.rpl = decimal.Zero
 	otx.commission = decimal.Zero // .. and no commissions, since it's made up.
 	glog.V(2).Infof("left with %s remaining after closing %s -> synthesized opening %s",
 		remaining, tx, &otx)

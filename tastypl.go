@@ -170,7 +170,13 @@ func (t *transaction) sanityCheck() {
 		pm := t.underlying + "P"
 		symbol = fmt.Sprintf(symfmt, pm, expDate, cp, strike)
 		if symbol != t.symbol {
-			glog.Fatalf("expected symbol %q but found %q in %s", symbol, t.symbol, t)
+			// Weekly index options have an additional "W" in the symbol.
+			// This is another hack to accept those.
+			pm := t.underlying + "W"
+			symbol = fmt.Sprintf(symfmt, pm, expDate, cp, strike)
+			if symbol != t.symbol {
+				glog.Fatalf("expected symbol %q but found %q in %s", symbol, t.symbol, t)
+			}
 		}
 	}
 }

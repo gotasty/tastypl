@@ -361,6 +361,10 @@ func (p *portfolio) parseNonOptionTransaction(record []string) {
 				// Interest paid, e.g. "FROM 10/16 THRU 11/15 @ 8    %"
 				p.intrs = p.intrs.Add(amount)
 				return
+			} else if record[4] == "Equity" && record[3] != "" {
+				// Interest paid on short stock (borrow fees)
+				p.intrs = p.intrs.Add(amount)
+				return
 			}
 			glog.V(2).Infof("unhandled money movement: %#v", record)
 			p.miscCash = p.miscCash.Add(amount)

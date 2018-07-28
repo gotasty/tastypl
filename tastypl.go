@@ -356,6 +356,14 @@ func (p *portfolio) parseNonOptionTransaction(record []string) {
 			p.intrs = p.intrs.Add(amount)
 		case "ACH DEPOSIT", "ACH DISBURSEMENT", "Wire Funds Received":
 			p.moneyMov = p.moneyMov.Add(amount)
+		case "Regulatory fee adjustment":
+			// TW incorrectly calculates some regulatory fees (!) so in order
+			// to fix the small discrepancies that build up over time, they
+			// reconcile the fees with what their clearing firm (Apex)
+			// actually charged by adding weekly transactions to adjust
+			// customer balances on their platforms. Can't believe they
+			// haven't fixed this by now, this has been going on for months...
+			p.fees = p.fees.Add(amount)
 		default:
 			if strings.HasPrefix(record[5], "FROM ") {
 				// Interest paid, e.g. "FROM 10/16 THRU 11/15 @ 8    %"

@@ -232,6 +232,8 @@ type recentKey struct {
 type portfolio struct {
 	ytd bool // Only track YTD transactions
 
+	ignoreacat bool // Ignore ACAT transactions
+
 	// All transactions.
 	transactions []*transaction
 
@@ -261,9 +263,10 @@ type portfolio struct {
 	numTrades uint16 // Number of trades executed
 }
 
-func NewPortfolio(records [][]string, ytd bool, nofutures bool) *portfolio {
+func NewPortfolio(records [][]string, ytd, nofutures, ignoreacat bool) *portfolio {
 	p := &portfolio{
 		ytd:              ytd,
+		ignoreacat:       ignoreacat,
 		positions:        make(map[string]*position),
 		recentTx:         make(map[recentKey][]*transaction),
 		rplPerUnderlying: make(map[string]decimal.Decimal),
@@ -566,6 +569,12 @@ func (p *portfolio) handleTrade(tx *transaction, count bool) {
 func (p *portfolio) handleAssignmentOrExercise(tx *transaction, count bool) {
 	expired := strings.HasSuffix(tx.description, "due to expiration.")
 	if !expired {
+		if p.ignoreacat {
+			if strings.HasSuffix(tx.description, "via ACAT") ||
+				tx.description == "Reversal for cost basis adjustment" {
+				return
+			}
+		}
 		// Trade caused by an assignment or exercise.
 		// We get two entries per position: one to tell us the position
 		// expired and was assigned/exercised, and one with the transaction
@@ -1135,10 +1144,10 @@ func (p *portfolio) PrintPL() {
 	}
 }
 
-func dumpChart(records [][]string, ytd bool, nofutures bool) {
+func dumpChart(records [][]string, ytd, nofutures, ignoreacat bool) {
 	// We don't really have a good way to track stats step by step, so rebuild the
 	// portfolio by adding the transactions one by one for now.
-	portfolio := NewPortfolio(records[1:2], ytd, nofutures) // Just the first transaction
+	portfolio := NewPortfolio(records[1:2], ytd, nofutures, ignoreacat) // Just the first transaction
 	var xv []time.Time
 	var rpl []float64
 	var adjRpl []float64
@@ -1259,6 +1268,7 @@ func main() {
 	positions := flag.Bool("positions", false, "print current positions")
 	chart := flag.Bool("chart", false, "create a chart of P&L")
 	nofutures := flag.Bool("nofutures", false, "ignore all futures transactions")
+	ignoreacat := flag.Bool("ignoreacat", false, "ignore all ACAT transfers")
 	flag.Parse()
 	if *input == "" {
 		glog.Fatal("-input flag required")
@@ -1271,7 +1281,7 @@ func main() {
 		glog.Fatal("CSV seems malformed")
 	}
 
-	portfolio := NewPortfolio(records[1:], *ytd, *nofutures)
+	portfolio := NewPortfolio(records[1:], *ytd, *nofutures, *ignoreacat)
 	if *stats {
 		portfolio.PrintStats()
 	}
@@ -1279,7 +1289,7 @@ func main() {
 		portfolio.PrintPL()
 	}
 	if *chart {
-		dumpChart(records, *ytd, *nofutures)
+		dumpChart(records, *ytd, *nofutures, *ignoreacat)
 	}
 	if *positions {
 		portfolio.PrintPositions()

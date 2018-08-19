@@ -283,7 +283,7 @@ func NewPortfolio(records [][]string, ytd, nofutures, ignoreacat bool) *portfoli
 	var prevRPL decimal.Decimal
 	logDailyRPL := func() {
 		if dpl := p.rpl.Sub(prevRPL); !dpl.Equal(decimal.Zero) {
-			glog.V(4).Infof("Day P/L realized for %s: %s", prevTime.Format("01/02/06"), dpl)
+			glog.V(4).Infof("Day P/L realized for %s: %9s", prevTime.Format("01/02/06"), dpl.StringFixed(2))
 			prevRPL = p.rpl
 		}
 	}

@@ -152,6 +152,9 @@ func (t *transaction) sanityCheck() {
 		glog.Fatalf("transaction date %s happened after expiration %s in %s",
 			t.date, t.expDate, t)
 	}
+	if t.instrument == "Future Option" {
+		return // TODO: symbology for options on futures
+	}
 	var cp byte
 	if t.call {
 		cp = 'C'
@@ -485,11 +488,35 @@ func (p *portfolio) parseTransaction(i int, rec []string, ytd *bool) *transactio
 				return nil
 			}
 		}
-		if strings.HasSuffix(instrument, "Option") {
+		if instrument == "Future Option" {
+			// As of version v0.31.5 TW's CSV export for options on futures is a bit buggy
+			// and various columns are not set, so we get here.  Work around that for now
+			// by extracting the columns from the description.
+			desc := strings.Split(rec[5], " ") // e.g.: Sold 1 /6EZ8 EUUV8 10/05/18 Put 1.15 @ 0.0027
+			if len(desc) != 9 {
+				glog.Fatalf("record #%d: expected 9 desc in futures options description: %q", i, rec[5])
+			}
+			switch desc[5] {
+			case "Put":
+			case "Call":
+				call = true
+			default:
+				glog.Fatalf("record %#d: future options is neither a call nor a put? %q", i, rec[5])
+			}
+			// Synthesize missing fields from the CSV:
+			rec[11] = "1"     // Multiplier
+			rec[12] = desc[2] // Underlying
+			rec[13] = desc[4] // Expiration date
+			rec[14] = desc[6] // Strike
+			if rec[3][0] == '.' {
+				rec[3] = rec[3][1:] // Not sure why TW adds a period at the beginning of the symbol
+			}
+		} else if strings.HasSuffix(instrument, "Option") {
 			glog.Fatalf("WTF, record #%d should be a non-option transaction: %q", i, rec)
+		} else {
+			// fallthrough (this is a trade but a non-option transaction)
+			option = false
 		}
-		// else: fallthrough (this is a trade but a non-option transaction)
-		option = false
 	default:
 		glog.Fatalf("record #%d, bad put/call type: %q", i, rec[15])
 	}

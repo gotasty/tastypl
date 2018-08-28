@@ -486,7 +486,7 @@ func (p *portfolio) parseTransaction(i int, rec []string, ytd *bool) *transactio
 			}
 		}
 		if strings.HasSuffix(instrument, "Option") {
-			glog.Fatal("WTF, record #%d should be a non-option transaction: %q", i, rec)
+			glog.Fatalf("WTF, record #%d should be a non-option transaction: %q", i, rec)
 		}
 		// else: fallthrough (this is a trade but a non-option transaction)
 		option = false
@@ -941,7 +941,7 @@ func (p *portfolio) PrintPositions() {
 					var err error
 					openPrice, err = decimal.NewFromString(p)
 					if err != nil {
-						glog.Fatal("Can't parse opening price of futures transaction %s: %s", open, err)
+						glog.Fatalf("Can't parse opening price of futures transaction %s: %s", open, err)
 					}
 				} else {
 					kind = "share"

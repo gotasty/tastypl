@@ -184,6 +184,38 @@ func (t *transaction) sanityCheck() {
 	}
 }
 
+// Helper function to work around the fact that some CSV records for options
+// on futures are missing fields we need but that we can thankfully extract
+// from the symbol.
+func parseFuturesOptionSymbol(rec []string) {
+	// e.g.: Sold 1 /6EZ8 EUUV8 10/05/18 Put 1.15 @ 0.0027
+	// Symbol: "./6EZ8 EUUV8 181005P1.15" -- not sure why the leading dot there.
+	symbol := rec[3]
+	if symbol[0] == '.' {
+		symbol = symbol[1:] // Not sure why there is a dot there but drop it
+		rec[3] = symbol
+	}
+	if symbol[0] != '/' {
+		glog.Fatalf("unexpected symbol for option on futures: %q", rec)
+	}
+	sym := strings.Split(symbol, " ")
+	// Synthesize missing fields from the CSV:
+	rec[11] = "1"    // Multiplier
+	rec[12] = sym[0] // Underlying
+
+	last := sym[len(sym)-1]                                 // <YYMMDD><P|C><strike>
+	rec[13] = last[2:4] + "/" + last[4:6] + "/" + last[0:2] // Expiration
+	rec[14] = last[7:]                                      // Strike
+	switch last[6] {
+	case 'C':
+		rec[15] = "CALL"
+	case 'P':
+		rec[15] = "PUT"
+	default:
+		glog.Fatalf("couldn't find P or C in symbol: %q", rec)
+	}
+}
+
 func (t *transaction) ytd() bool {
 	return t.date.After(ytdStart)
 }
@@ -491,26 +523,9 @@ func (p *portfolio) parseTransaction(i int, rec []string, ytd *bool) *transactio
 		if instrument == "Future Option" {
 			// As of version v0.31.5 TW's CSV export for options on futures is a bit buggy
 			// and various columns are not set, so we get here.  Work around that for now
-			// by extracting the columns from the description.
-			desc := strings.Split(rec[5], " ") // e.g.: Sold 1 /6EZ8 EUUV8 10/05/18 Put 1.15 @ 0.0027
-			if len(desc) != 9 {
-				glog.Fatalf("record #%d: expected 9 desc in futures options description: %q", i, rec[5])
-			}
-			switch desc[5] {
-			case "Put":
-			case "Call":
-				call = true
-			default:
-				glog.Fatalf("record %#d: future options is neither a call nor a put? %q", i, rec[5])
-			}
-			// Synthesize missing fields from the CSV:
-			rec[11] = "1"     // Multiplier
-			rec[12] = desc[2] // Underlying
-			rec[13] = desc[4] // Expiration date
-			rec[14] = desc[6] // Strike
-			if rec[3][0] == '.' {
-				rec[3] = rec[3][1:] // Not sure why TW adds a period at the beginning of the symbol
-			}
+			// by extracting the columns from the symbol.
+			parseFuturesOptionSymbol(rec)
+			call = rec[15] == "CALL"
 		} else if strings.HasSuffix(instrument, "Option") {
 			glog.Fatalf("WTF, record #%d should be a non-option transaction: %q", i, rec)
 		} else {

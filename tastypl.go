@@ -80,6 +80,19 @@ var (
 
 	// Cutoff point for YTD stuff.
 	ytdStart = time.Date(time.Now().Year(), 1, 1, 0, 0, 0, 0, time.Now().Location())
+
+	indexSymbols = map[string]struct{}{
+		"SPX": struct{}{},
+		"RUT": struct{}{},
+		"DJX": struct{}{},
+		"OEX": struct{}{},
+		"VIX": struct{}{},
+		"NDX": struct{}{},
+		"MNX": struct{}{},
+		"RVX": struct{}{},
+		"XSP": struct{}{},
+		"XEO": struct{}{},
+	}
 )
 
 func (t *transaction) String() string {
@@ -168,6 +181,9 @@ func (t *transaction) sanityCheck() {
 	const symfmt = "%- 6s%s%c%08d"
 	symbol := fmt.Sprintf(symfmt, t.underlying, expDate, cp, strike)
 	if symbol != t.symbol {
+		if _, index := indexSymbols[t.underlying]; !index {
+			glog.Fatalf("expected symbol %q but found %q in %s", symbol, t.symbol, t)
+		}
 		// PM-settled index options have an additional "P" in the symbol.
 		// This is a hack to accept those.
 		pm := t.underlying + "P"
@@ -175,8 +191,8 @@ func (t *transaction) sanityCheck() {
 		if symbol != t.symbol {
 			// Weekly index options have an additional "W" in the symbol.
 			// This is another hack to accept those.
-			pm := t.underlying + "W"
-			symbol = fmt.Sprintf(symfmt, pm, expDate, cp, strike)
+			wk := t.underlying + "W"
+			symbol = fmt.Sprintf(symfmt, wk, expDate, cp, strike)
 			if symbol != t.symbol {
 				glog.Fatalf("expected symbol %q but found %q in %s", symbol, t.symbol, t)
 			}

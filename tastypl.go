@@ -99,11 +99,12 @@ func (t *transaction) String() string {
 	return t.description
 }
 
+// NetCredit is the net credit after rolls on a per contract basis.
 func (t *transaction) NetCredit() decimal.Decimal {
-	net := t.value
+	net := t.avgPrice
 	earlier := t.rolledFrom
 	for earlier != nil {
-		net = net.Add(earlier.rpl)
+		net = net.Add(earlier.rpl.Div(earlier.quantity))
 		earlier = earlier.openTx.rolledFrom
 	}
 	return net
@@ -807,7 +808,7 @@ func (p *portfolio) closePosition(tx *transaction, count bool) {
 		// Close off this opening transaction.
 		open.qtyOpen = open.qtyOpen.Sub(closed)
 		tx.openTx = open
-		tx.rpl = rpl
+		tx.rpl = tx.rpl.Add(rpl)
 		if count {
 			p.recordPL(tx, rpl)
 		}
@@ -1031,12 +1032,12 @@ func (p *portfolio) PrintPositions() {
 			var netcr decimal.Decimal // net credit
 			if open.rolledFrom != nil {
 				netcr = open.NetCredit()
-				if netcr.LessThanOrEqual(open.value) {
-					net = fmt.Sprintf(", booked loss %s", perContract(open.value.Sub(netcr).Div(mult)))
+				if netcr.LessThanOrEqual(open.avgPrice) {
+					net = fmt.Sprintf(", booked loss %s", perContract(open.avgPrice.Sub(netcr).Div(mult)))
 				}
 				net = fmt.Sprintf(" (net credit %s%s)", perContract(netcr.Div(mult)), net)
 			} else {
-				netcr = open.value
+				netcr = open.avgPrice
 			}
 			// Break even point = strike + premium for calls, strike - premium for puts.
 			bep := netcr.Abs().Div(mult).Div(open.qtyOpen) // Premium per share
@@ -1044,7 +1045,7 @@ func (p *portfolio) PrintPositions() {
 				bep = bep.Neg() // For a put we subtract instead
 			}
 			bep = bep.Add(open.strike)
-			fmt.Printf("  %s %s %s $%s %-4s @ %s [BEP=%s] %s\n",
+			fmt.Printf("  %s %s %s $%s %-4s @ %s [BEP=%s]%s\n",
 				open.expDate.Format(expFmt), long, open.qtyOpen, open.strike,
 				call, open.avgPrice.Div(mult), bep.StringFixed(2), net)
 

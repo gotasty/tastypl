@@ -971,9 +971,13 @@ func (p *portfolio) PrintPositions() {
 				return true
 			} else if a.expDate.After(b.expDate) {
 				return false
+			} else if a.strike.LessThan(b.strike) {
+				return true
+			} else if b.strike.LessThan(a.strike) {
+				return false
 			}
-			// Same exp date, break tie by strike.
-			return a.strike.LessThan(b.strike)
+			// Same exp date & same strike, break tie by premium.
+			return a.avgPrice.LessThan(b.avgPrice)
 		})
 		var prevUsed bool // true if the previous leg was included as part of a multi-leg position.
 		for i, open := range pos.opens {

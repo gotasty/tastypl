@@ -1147,14 +1147,14 @@ func (p *portfolio) PrintStats() {
 		}
 		return amount.Mul(oneHundred).Div(p.rpl).StringFixed(2) + "%"
 	}
-	fmt.Printf("Number of transactions: %5d    (in %d days => %.1f/day avg)\n",
+	fmt.Printf("Number of transactions: %6d    (in %d days => %.1f/day avg)\n",
 		numTrades, days, float32(numTrades)/float32(days))
-	fmt.Printf("Realized P&L:           %8s\n", p.rpl.StringFixed(2))
-	fmt.Printf("Commissions:            %8s (%s of P&L)\n", p.comms.StringFixed(2), pct(p.comms))
-	fmt.Printf("Fees:                   %8s (%s of P&L)\n", p.fees.StringFixed(2), pct(p.fees))
-	fmt.Printf("Interest:               %8s (%s of P&L)\n", p.intrs.StringFixed(2), pct(p.intrs))
+	fmt.Printf("Realized P&L:           %9s\n", p.rpl.StringFixed(2))
+	fmt.Printf("Commissions:            %9s (%s of P&L)\n", p.comms.StringFixed(2), pct(p.comms))
+	fmt.Printf("Fees:                   %9s (%s of P&L)\n", p.fees.StringFixed(2), pct(p.fees))
+	fmt.Printf("Interest:               %9s (%s of P&L)\n", p.intrs.StringFixed(2), pct(p.intrs))
 	grosspl := p.rpl.Add(p.comms).Add(p.fees).Add(p.intrs)
-	fmt.Printf("Gross P&L:              %8s (~%s/day avg, %s of P&L)\n",
+	fmt.Printf("Gross P&L:              %9s (~%s/day avg, %s of P&L)\n",
 		grosspl.StringFixed(2),
 		grosspl.Div(decimal.New(int64(days), 0)).StringFixed(2), pct(grosspl))
 	var premium decimal.Decimal
@@ -1174,15 +1174,15 @@ func (p *portfolio) PrintStats() {
 			}
 		}
 	}
-	fmt.Printf("Equity:                 %8s (%d positions)\n", equity.StringFixed(2), neq)
-	fmt.Printf("Adjusted Gross P&L:     %8s\n", grosspl.Add(equity).StringFixed(2))
-	fmt.Printf("Net money movements:    %8s\n", p.moneyMov.StringFixed(2))
-	fmt.Printf("Outstanding premium:    %8s\n", p.premium.StringFixed(2))
+	fmt.Printf("Equity:                 %9s (%d positions)\n", equity.StringFixed(2), neq)
+	fmt.Printf("Adjusted Gross P&L:     %9s\n", grosspl.Add(equity).StringFixed(2))
+	fmt.Printf("Net money movements:    %9s\n", p.moneyMov.StringFixed(2))
+	fmt.Printf("Outstanding premium:    %9s\n", p.premium.StringFixed(2))
 	if !premium.Equal(p.premium) {
 		fmt.Printf("-> Warning: estimated outstanding premium should've been %s (difference: %s)\n",
 			premium.StringFixed(2), premium.Sub(p.premium).StringFixed(2))
 	}
-	fmt.Printf("Cash on hand:           %8s\n", p.cash.StringFixed(2))
+	fmt.Printf("Cash on hand:           %9s\n", p.cash.StringFixed(2))
 	if !p.ytd {
 		// Alternative method to compute cash on hand
 		cash := grosspl.Add(premium).Add(p.moneyMov).Add(equity).Add(equityDiscount).Add(p.miscCash)
@@ -1203,7 +1203,7 @@ func (p *portfolio) PrintPL() {
 	}
 	sort.Sort(sort.StringSlice(underlyings))
 	for _, underlying := range underlyings {
-		fmt.Printf("%-6s%8s\n", underlying, p.rplPerUnderlying[underlying].StringFixed(2))
+		fmt.Printf("%-6s%9s\n", underlying, p.rplPerUnderlying[underlying].StringFixed(2))
 	}
 }
 

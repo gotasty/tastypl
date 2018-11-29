@@ -628,9 +628,15 @@ func (p *portfolio) handleTrade(tx *transaction, count bool) {
 func (p *portfolio) handleAssignmentOrExercise(tx *transaction, count bool) {
 	expired := strings.HasSuffix(tx.description, "due to expiration.")
 	if !expired {
-		if p.ignoreacat {
-			if strings.HasSuffix(tx.description, "via ACAT") ||
-				tx.description == "Reversal for cost basis adjustment" {
+		if strings.HasSuffix(tx.description, "via ACAT") ||
+			tx.description == "Reversal for cost basis adjustment" {
+			if strings.HasPrefix(tx.description, "Removed ") {
+				glog.V(4).Infof("ACAT transfer out: %s (following P&L ignored)", tx)
+				p.closePosition(tx, false)
+				return
+			}
+			if p.ignoreacat {
+				glog.Info("ignoreacat return")
 				return
 			}
 		}

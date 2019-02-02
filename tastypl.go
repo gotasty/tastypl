@@ -507,12 +507,15 @@ func (p *portfolio) parseTransaction(i int, rec []string, ytd *bool) *transactio
 	}
 	value := parseDecimal(rec[6])
 	comm := parseDecimal(rec[9])
-	if comm.GreaterThan(decimal.Zero) {
-		glog.Fatalf("record #%d, positive commission amount %s", i, rec[9])
+	// When TW fixes up a transaction due to a bug/issue on their end, they
+	// rollback a previous one, which leads to positive commission/fee amounts.
+	adminTx := rec[1] == "Administrative Transfer"
+	if comm.GreaterThan(decimal.Zero) && !adminTx {
+		glog.Fatalf("record #%d, positive commission amount %s in %q", i, rec[9], rec)
 	}
 	fees := parseDecimal(rec[10])
-	if fees.GreaterThan(decimal.Zero) {
-		glog.Fatalf("record #%d, positive fees amount %s", i, rec[10])
+	if fees.GreaterThan(decimal.Zero) && !adminTx {
+		glog.Fatalf("record #%d, positive fees amount %s in %q", i, rec[10], rec)
 	}
 	p.cash = p.cash.Add(value).Add(comm).Add(fees)
 	txType := rec[1]
@@ -737,6 +740,8 @@ func (p *portfolio) handleTransaction(tx *transaction) {
 		// caused by option positions assignments/exercises aren't really
 		// trades per se.
 		p.numTrades++
+		fallthrough
+	case "Administrative Transfer":
 		p.handleTrade(tx, count)
 	case "Receive Deliver":
 		p.handleAssignmentOrExercise(tx, count)

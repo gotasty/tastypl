@@ -1161,9 +1161,9 @@ func (p *portfolio) PrintStats() {
 	fmt.Printf("Number of transactions: %6d    (in %d days => %.1f/day avg)\n",
 		numTrades, days, float32(numTrades)/float32(days))
 	fmt.Printf("Realized P&L:           %9s\n", p.rpl.StringFixed(2))
-	fmt.Printf("Commissions:            %9s (%s of P&L)\n", p.comms.StringFixed(2), pct(p.comms))
-	fmt.Printf("Fees:                   %9s (%s of P&L)\n", p.fees.StringFixed(2), pct(p.fees))
-	fmt.Printf("Interest:               %9s (%s of P&L)\n", p.intrs.StringFixed(2), pct(p.intrs))
+	fmt.Printf("Commissions:            %9s (%s of P&L)\n", p.comms.StringFixed(2), pct(p.comms.Neg()))
+	fmt.Printf("Fees:                   %9s (%s of P&L)\n", p.fees.StringFixed(2), pct(p.fees.Neg()))
+	fmt.Printf("Interest:               %9s (%s of P&L)\n", p.intrs.StringFixed(2), pct(p.intrs.Neg()))
 	grosspl := p.rpl.Add(p.comms).Add(p.fees).Add(p.intrs)
 	fmt.Printf("Gross P&L:              %9s (~%s/day avg, %s of P&L)\n",
 		grosspl.StringFixed(2),

@@ -52,6 +52,7 @@ type transaction struct {
 
 	// Various flags inferred from the transactions to help make things simpler.
 	option bool // or non-option (such as future/equity) if false
+	future bool // true if futures (or options on futures), else equity or index
 	mtm    bool // mark-to-market daily settlement for futures
 	call   bool // or put if false
 	long   bool // or short if false
@@ -168,7 +169,7 @@ func (t *transaction) sanityCheck() {
 		glog.Fatalf("transaction date %s happened after expiration %s in %s",
 			t.date, t.expDate, t)
 	}
-	if t.instrument == "Future Option" {
+	if t.future {
 		return // TODO: symbology for options on futures
 	}
 	var cp byte
@@ -487,7 +488,7 @@ func (p *portfolio) parseTransactions(records [][]string, nofutures bool) {
 	ytd := p.ytd
 	for i, rec := range records {
 		if tx := p.parseTransaction(i, rec, &ytd); tx != nil {
-			if nofutures && tx.instrument == "Future" {
+			if nofutures && tx.future {
 				continue
 			}
 			p.transactions[j] = tx
@@ -598,6 +599,7 @@ func (p *portfolio) parseTransaction(i int, rec []string, ytd *bool) *transactio
 		expDate:     expDate,
 		strike:      parseDecimal(rec[14]),
 		option:      option,
+		future:      strings.HasPrefix(instrument, "Future"),
 		mtm:         mtm,
 		call:        call,
 		long:        long,
@@ -650,7 +652,7 @@ func (p *portfolio) handleTrade(tx *transaction, count bool) {
 		p.closePosition(tx, count)
 		p.detectRoll(tx)
 	default:
-		if tx.instrument == "Future" {
+		if tx.future && !tx.option {
 			// TODO check what happens for equities
 			if tx.value.Equal(decimal.Zero) { // Open
 				p.openPosition(tx)
@@ -972,7 +974,7 @@ func (p *portfolio) PrintPositions() {
 	for _, pos := range p.positions {
 		for _, open := range pos.opens {
 			underlying := open.underlying
-			if open.instrument == "Future" {
+			if open.future {
 				// Drop the month and year
 				underlying = underlying[:len(underlying)-2]
 			}
@@ -1043,7 +1045,7 @@ func (p *portfolio) PrintPositions() {
 				}
 				var kind string
 				var openPrice decimal.Decimal
-				if open.instrument == "Future" {
+				if open.future {
 					kind = "contract"
 					// Parse the open price from the description :-/
 					p := open.description[strings.IndexByte(open.description, '@')+2:]
@@ -1211,7 +1213,7 @@ func (p *portfolio) PrintStats() {
 		for _, open := range pos.opens {
 			if open.option {
 				premium = premium.Add(open.avgPrice.Mul(open.qtyOpen))
-			} else if open.instrument != "Future" {
+			} else if !open.future {
 				// Adjust for the number of shares actually still open
 				scale := open.qtyOpen.Div(open.quantity)
 				equity = equity.Add(open.value).Mul(scale)

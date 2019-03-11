@@ -158,6 +158,8 @@ func (t *transaction) sanityCheck() {
 		glog.Fatalf("options position can't be marked-to-market in %s", t)
 	} else if t.multiplier == 0 {
 		glog.Fatalf("options position must have a non-zero multiplier in %s", t)
+	} else if !t.quantity.Equal(t.quantity.Truncate(0)) {
+		glog.Fatalf("options quantity must be a whole number in %s", t)
 	}
 	if t.strike.LessThanOrEqual(decimal.Zero) {
 		glog.Fatalf("strike price can't be less than or equal to zero in %s", t)
@@ -308,6 +310,14 @@ type portfolio struct {
 	intrs decimal.Decimal // interest
 	// Misc. cash changes
 	miscCash decimal.Decimal
+
+	// Cumulative tallies
+	optionsNotionalSold   decimal.Decimal
+	optionsNotionalBought decimal.Decimal
+	putsTraded            int64
+	callsTraded           int64
+	equityNotionalSold    decimal.Decimal
+	equityNotionalBought  decimal.Decimal
 
 	// Summary of realized P&L per underlying
 	rplPerUnderlying map[string]decimal.Decimal
@@ -607,6 +617,31 @@ func (p *portfolio) parseTransaction(i int, rec []string, ytd *bool) *transactio
 }
 
 func (p *portfolio) handleTrade(tx *transaction, count bool) {
+	// Update cumulative stats.
+	if count {
+		if tx.option {
+			if tx.open {
+				contracts := tx.quantity.IntPart()
+				if tx.call {
+					p.callsTraded += contracts
+				} else {
+					p.putsTraded += contracts
+				}
+			}
+			if tx.long {
+				p.optionsNotionalBought = p.optionsNotionalBought.Add(tx.value)
+			} else {
+				p.optionsNotionalSold = p.optionsNotionalSold.Add(tx.value)
+			}
+		} else if tx.instrument == "Equity" {
+			if tx.long {
+				p.equityNotionalBought = p.equityNotionalBought.Add(tx.value)
+			} else {
+				p.equityNotionalSold = p.equityNotionalSold.Add(tx.value)
+			}
+		}
+	}
+
 	switch tx.action {
 	case "SELL_TO_OPEN", "BUY_TO_OPEN":
 		p.openPosition(tx)
@@ -930,7 +965,7 @@ func (p *portfolio) detectRoll(tx *transaction) {
 }
 
 func (p *portfolio) PrintPositions() {
-	fmt.Println("----- Current portfolio -----")
+	fmt.Println("----- Current portfolio ------")
 
 	// First group all the positions per underlying
 	perUnderlying := make(map[string]*position, len(p.positions))
@@ -1122,9 +1157,9 @@ func (p *portfolio) PrintPositions() {
 
 func (p *portfolio) PrintStats() {
 	if p.ytd {
-		fmt.Println("------- YTD statistics ------")
+		fmt.Println("------- YTD statistics -------")
 	} else {
-		fmt.Println("----- Overall statistics ----")
+		fmt.Println("----- Overall statistics -----")
 	}
 	if len(p.transactions) < 2 {
 		fmt.Println("Not enough transactions yet")
@@ -1204,8 +1239,21 @@ func (p *portfolio) PrintStats() {
 	}
 }
 
+func (p *portfolio) PrintCumulativeStats() {
+	fmt.Println("------ Cumulative stats ------")
+	fmt.Printf("Contracts traded:       %6d\n", p.putsTraded+p.callsTraded)
+	fmt.Printf("  Puts traded:          %6d\n", p.putsTraded)
+	fmt.Printf("  Calls traded:         %6d\n", p.callsTraded)
+	fmt.Printf("Notional sold:        %11s\n", p.optionsNotionalSold.StringFixed(2))
+	fmt.Printf("Notional bought:      %11s\n", p.optionsNotionalBought.StringFixed(2))
+	fmt.Printf("  Difference:         %11s\n", p.optionsNotionalSold.Add(p.optionsNotionalBought).StringFixed(2))
+	fmt.Printf("Equities sold:        %11s\n", p.equityNotionalSold.StringFixed(2))
+	fmt.Printf("Equities bought:      %11s\n", p.equityNotionalBought.StringFixed(2))
+	fmt.Printf("  Difference:         %11s\n", p.equityNotionalSold.Add(p.equityNotionalBought).StringFixed(2))
+}
+
 func (p *portfolio) PrintPL() {
-	fmt.Println("---- Realized P&L detail ----")
+	fmt.Println("---- Realized P&L detail -----")
 	underlyings := make([]string, len(p.rplPerUnderlying))
 	var i int
 	for underlying := range p.rplPerUnderlying {
@@ -1337,6 +1385,7 @@ func dumpChart(records [][]string, ytd, nofutures, ignoreacat bool) {
 func main() {
 	input := flag.String("input", "", "input csv file containing tastyworks transactions")
 	stats := flag.Bool("stats", true, "print overall statistics")
+	cumulative := flag.Bool("cumulative", true, "print cumulative statistics")
 	ytd := flag.Bool("ytd", false, "limit output to YTD transactions")
 	printPL := flag.Bool("printpl", false, "print realized P&L per underlying")
 	positions := flag.Bool("positions", false, "print current positions")
@@ -1358,6 +1407,9 @@ func main() {
 	portfolio := NewPortfolio(records[1:], *ytd, *nofutures, *ignoreacat)
 	if *stats {
 		portfolio.PrintStats()
+	}
+	if *cumulative {
+		portfolio.PrintCumulativeStats()
 	}
 	if *printPL {
 		portfolio.PrintPL()

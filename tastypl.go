@@ -679,6 +679,25 @@ func (p *portfolio) handleAssignmentOrExercise(tx *transaction, count bool) {
 				glog.Info("ignoreacat return")
 				return
 			}
+		} else if strings.HasPrefix(tx.description, "Cash settlement of") { // e.g. for VIX options that expire ITM
+			glog.V(4).Infof("Recording P/L for %s of %s", tx, tx.value)
+			// Sucks that we have to record the P/L manually here. We can't
+			// just fall through to calling handleTrade() below because that
+			// will close the position. The settlement is actually two
+			// transactions: one for the cash settlement, one for the
+			// expiration.  So here we handle the cash settlement manually,
+			// and the next transaction will actually expire (i.e. close) the
+			// opening transaction, without recording any P/L.
+			p.recordPL(tx, tx.value)
+			if !tx.option {
+				glog.Fatalf("not an options trade %s: %#v", tx, tx)
+			}
+			if tx.long {
+				p.optionsNotionalSold = p.optionsNotionalSold.Add(tx.value)
+			} else {
+				p.optionsNotionalBought = p.optionsNotionalBought.Add(tx.value)
+			}
+			return
 		}
 		// Trade caused by an assignment or exercise.
 		// We get two entries per position: one to tell us the position
@@ -697,7 +716,7 @@ func (p *portfolio) handleAssignmentOrExercise(tx *transaction, count bool) {
 	// possible on TW.
 	pos, ok := p.positions[tx.symbol]
 	if !ok {
-		glog.Fatalf("Couldn't find an opening transaction for %s", tx)
+		glog.Fatalf("Couldn't find an opening transaction for %s %#v", tx, tx)
 	}
 	remaining := tx.quantity.Abs() // clone
 	for _, open := range pos.opens {

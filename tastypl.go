@@ -667,15 +667,17 @@ func (p *portfolio) handleTrade(tx *transaction, count bool) {
 func (p *portfolio) handleAssignmentOrExercise(tx *transaction, count bool) {
 	expired := strings.HasSuffix(tx.description, "due to expiration.")
 	if !expired {
-		if strings.HasSuffix(tx.description, "via ACAT") ||
-			tx.description == "Reversal for cost basis adjustment" {
+		costBasisAdj := tx.description == "Reversal for cost basis adjustment"
+		if strings.HasSuffix(tx.description, "via ACAT") || costBasisAdj {
 			if strings.HasPrefix(tx.description, "Removed ") {
 				glog.V(4).Infof("ACAT transfer out: %s (following P&L ignored)", tx)
 				p.closePosition(tx, false)
 				return
-			}
-			if p.ignoreacat {
-				glog.Info("ignoreacat return")
+			} else if costBasisAdj && !tx.open {
+				glog.V(8).Infof("Ignored ACAT cost basis adjustment %s", tx)
+				return
+			} else if p.ignoreacat {
+				glog.V(7).Infof("Ignored ACAT %s", tx)
 				return
 			}
 		} else if strings.HasPrefix(tx.description, "Cash settlement of") { // e.g. for VIX options that expire ITM
@@ -697,6 +699,10 @@ func (p *portfolio) handleAssignmentOrExercise(tx *transaction, count bool) {
 				p.optionsNotionalBought = p.optionsNotionalBought.Add(tx.value)
 			}
 			return
+		}
+		if tx.open && !tx.future && tx.value.Equal(decimal.Zero) {
+			glog.Infof("Incoming ACAT without a cost basis in %s: %s on %s",
+				tx.underlying, tx, tx.date)
 		}
 		// Trade caused by an assignment or exercise.
 		// We get two entries per position: one to tell us the position

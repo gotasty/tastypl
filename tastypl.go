@@ -211,10 +211,6 @@ func parseFuturesOptionSymbol(rec []string) {
 	// e.g.: Sold 1 /6EZ8 EUUV8 10/05/18 Put 1.15 @ 0.0027
 	// Symbol: "./6EZ8 EUUV8 181005P1.15" -- not sure why the leading dot there.
 	symbol := rec[3]
-	if symbol[0] == '.' {
-		symbol = symbol[1:] // Not sure why there is a dot there but drop it
-		rec[3] = symbol
-	}
 	if symbol[0] != '/' {
 		glog.Fatalf("unexpected symbol for option on futures: %q", rec)
 	}
@@ -534,6 +530,9 @@ func (p *portfolio) parseTransaction(i int, rec []string, ytd *bool) *transactio
 	var call bool
 	var mtm bool
 	option := true
+	if instrument == "Future Option" && rec[3][0] == '.' {
+		rec[3] = rec[3][1:] // Not sure why there is a dot there but drop it
+	}
 	switch rec[15] {
 	case "PUT":
 	case "CALL":

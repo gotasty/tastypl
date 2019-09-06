@@ -94,6 +94,50 @@ var (
 		"XSP": struct{}{},
 		"XEO": struct{}{},
 	}
+
+	// How many dollars is one point worth.
+	// This is madness. Can't wait for the Small Exchange.
+	futuresPoints = map[string]decimal.Decimal{
+		// Equities
+		"/ES":  decimal.RequireFromString("50"),
+		"/MES": decimal.RequireFromString("5"),
+		"/YM":  decimal.RequireFromString("5"),
+		"/MYM": decimal.RequireFromString("0.5"),
+		"/NQ":  decimal.RequireFromString("20"),
+		"/MNQ": decimal.RequireFromString("2"),
+		"/RTY": decimal.RequireFromString("50"),
+		"/M2K": decimal.RequireFromString("5"),
+		// Yield curve
+		"/GE": decimal.RequireFromString("2500"),
+		"/ZT": decimal.RequireFromString("2000"),
+		"/ZF": decimal.RequireFromString("1000"),
+		"/ZN": decimal.RequireFromString("1000"),
+		"/ZB": decimal.RequireFromString("1000"),
+		// Metals
+		"/GC":  decimal.RequireFromString("100"),
+		"/MGC": decimal.RequireFromString("10"),
+		"/SI":  decimal.RequireFromString("5000"),
+		// Energy
+		"/CL": decimal.RequireFromString("1000"),
+		"/QM": decimal.RequireFromString("500"),
+		"/NG": decimal.RequireFromString("10000"),
+		"/QG": decimal.RequireFromString("2500"),
+		// Ags
+		"/ZC": decimal.RequireFromString("50"),
+		"/ZS": decimal.RequireFromString("50"),
+		"/ZW": decimal.RequireFromString("50"),
+		// FX
+		"/6A":  decimal.RequireFromString("100000"),
+		"/M6A": decimal.RequireFromString("10000"),
+		"/6B":  decimal.RequireFromString("62500"),
+		"/M6B": decimal.RequireFromString("6250"),
+		"/6C":  decimal.RequireFromString("100000"),
+		"/6E":  decimal.RequireFromString("125000"),
+		"/M6E": decimal.RequireFromString("12500"),
+		"/6J":  decimal.RequireFromString("125000000"),
+		// Crypto
+		"/BTC": decimal.RequireFromString("5"),
+	}
 )
 
 func (t *transaction) String() string {
@@ -155,7 +199,6 @@ func (t *transaction) sanityCheck() {
 	if !t.option {
 		return // TODO: no other check yet for futures/equities
 	} else if t.mtm {
-		// Might not be true for options on futures (?)
 		glog.Fatalf("options position can't be marked-to-market in %s", t)
 	} else if t.multiplier == 0 {
 		glog.Fatalf("options position must have a non-zero multiplier in %s", t)
@@ -202,6 +245,31 @@ func (t *transaction) sanityCheck() {
 			}
 		}
 	}
+}
+
+func (t *transaction) parsePrice() decimal.Decimal {
+	// Parse the open price from the description :-/
+	at := strings.IndexByte(t.description, '@')
+	var adj decimal.Decimal
+	if at == -1 {
+		prefix := "Removal of " + t.underlying + " due to expiration, last mark:"
+		if !strings.HasPrefix(t.description, prefix) {
+			glog.Fatal("Can't infer transaction price from %s", t)
+		}
+		at = len(prefix) - 1
+		contract := t.underlying[:len(t.underlying)-2]
+		pointValue, ok := futuresPoints[contract]
+		if !ok {
+			glog.Fatalf("Don't know how much a point of %s is worth in %s", contract, t)
+		}
+		adj = t.value.Div(pointValue)
+	}
+	p := t.description[at+2:]
+	price, err := decimal.NewFromString(p)
+	if err != nil {
+		glog.Fatalf("Can't parse opening price of futures transaction %s: %s", t, err)
+	}
+	return price.Add(adj)
 }
 
 // Helper function to work around the fact that some CSV records for options
@@ -291,6 +359,9 @@ type portfolio struct {
 	// Recent transactions, used to detect rolls of options positions.
 	// Transactions older than rollWindow should get purged.
 	recentTx map[recentKey][]*transaction
+	// Map a futures contract name to the last mark to market settlement
+	// price seen for that contract.
+	lastMarkToMarket map[string]decimal.Decimal
 
 	moneyMov decimal.Decimal // sum of all ACH/wire movements
 
@@ -315,6 +386,8 @@ type portfolio struct {
 	callsTraded           int64
 	equityNotionalSold    decimal.Decimal
 	equityNotionalBought  decimal.Decimal
+	futuresNotionalSold   decimal.Decimal
+	futuresNotionalBought decimal.Decimal
 
 	// Summary of realized P&L per underlying
 	rplPerUnderlying map[string]decimal.Decimal
@@ -328,6 +401,7 @@ func NewPortfolio(records [][]string, ytd, nofutures, ignoreacat bool) *portfoli
 		ignoreacat:       ignoreacat,
 		positions:        make(map[string]*position),
 		recentTx:         make(map[recentKey][]*transaction),
+		lastMarkToMarket: make(map[string]decimal.Decimal),
 		rplPerUnderlying: make(map[string]decimal.Decimal),
 	}
 
@@ -561,6 +635,13 @@ func (p *portfolio) parseTransaction(i int, rec []string, ytd *bool) *transactio
 		} else {
 			// fallthrough (this is a trade but a non-option transaction)
 			option = false
+			if txType == "Receive Deliver" && instrument == "Future" && strings.HasSuffix(rec[5], "due to expiration") {
+				lastMark, ok := p.lastMarkToMarket[rec[3]]
+				if !ok {
+					glog.Fatalf("Future expired without ever getting marked: %s", rec)
+				}
+				rec[5] += ", last mark: " + lastMark.String()
+			}
 		}
 	default:
 		glog.Fatalf("record #%d, bad put/call type: %q", i, rec[15])
@@ -614,7 +695,50 @@ func (p *portfolio) parseTransaction(i int, rec []string, ytd *bool) *transactio
 	// Pending clarification from TW support.
 	//tx.fixFees()
 	tx.sanityCheck()
+	if tx.mtm {
+		p.updateSettlementPrice(tx)
+	}
 	return tx
+}
+
+func (p *portfolio) updateSettlementPrice(tx *transaction) {
+	if !tx.mtm {
+		glog.Fatalf("must pass a futures mark-to-market transaction in argument, got %s", tx)
+	}
+	prefix := tx.underlying + " mark to market at "
+	if !strings.HasPrefix(tx.description, prefix) {
+		glog.Fatalf("Unexpected futures mark-to-market tx description %q", tx)
+	}
+	price := tx.description[len(prefix):]
+	space := strings.IndexByte(price, ' ')
+	if space <= 0 {
+		glog.Fatalf("Unexpected futures mark-to-market tx description %q", tx)
+	}
+	price = price[:space]
+	mark, err := decimal.NewFromString(price)
+	if err != nil {
+		glog.Fatalf("Can't parse futures mark-to-market settlement value %q from %q", price, tx)
+	}
+	p.lastMarkToMarket[tx.underlying] = mark
+}
+
+// For a transction on an outright futures, return the notional amount of the
+// price at which the transaction was filled.
+func futuresNotional(tx *transaction) decimal.Decimal {
+	if !tx.future {
+		glog.Fatalf("expected a futures transaction but got %s", tx)
+	}
+	points := tx.parsePrice()
+	contract := tx.underlying[:len(tx.underlying)-2]
+	pointValue, ok := futuresPoints[contract]
+	if !ok {
+		glog.Fatalf("Don't know how much a point of %s is worth in %s", contract, tx)
+	}
+	notional := points.Mul(pointValue).Mul(tx.quantity)
+	if tx.long {
+		notional = notional.Neg()
+	}
+	return notional
 }
 
 func (p *portfolio) handleTrade(tx *transaction, count bool) {
@@ -633,6 +757,13 @@ func (p *portfolio) handleTrade(tx *transaction, count bool) {
 				p.optionsNotionalBought = p.optionsNotionalBought.Add(tx.value)
 			} else {
 				p.optionsNotionalSold = p.optionsNotionalSold.Add(tx.value)
+			}
+		} else if tx.future { // outright futures (futures options are handled in the case above)
+			notional := futuresNotional(tx)
+			if tx.long {
+				p.futuresNotionalBought = p.futuresNotionalBought.Add(notional)
+			} else {
+				p.futuresNotionalSold = p.futuresNotionalSold.Add(notional)
 			}
 		} else if tx.instrument == "Equity" {
 			if tx.long {
@@ -1071,13 +1202,7 @@ func (p *portfolio) PrintPositions() {
 				var openPrice decimal.Decimal
 				if open.future {
 					kind = "contract"
-					// Parse the open price from the description :-/
-					p := open.description[strings.IndexByte(open.description, '@')+2:]
-					var err error
-					openPrice, err = decimal.NewFromString(p)
-					if err != nil {
-						glog.Fatalf("Can't parse opening price of futures transaction %s: %s", open, err)
-					}
+					openPrice = open.parsePrice()
 				} else {
 					kind = "share"
 					openPrice = open.avgPrice.Abs()
@@ -1276,6 +1401,22 @@ func (p *portfolio) PrintCumulativeStats() {
 	fmt.Printf("Equities sold:        %11s\n", p.equityNotionalSold.StringFixed(2))
 	fmt.Printf("Equities bought:      %11s\n", p.equityNotionalBought.StringFixed(2))
 	fmt.Printf("  Difference:         %11s\n", p.equityNotionalSold.Add(p.equityNotionalBought).StringFixed(2))
+	var notionalOpen decimal.Decimal
+	for _, pos := range p.positions {
+		for _, open := range pos.opens {
+			if open.future && !open.option {
+				notionalOpen = notionalOpen.Add(futuresNotional(open))
+			}
+		}
+	}
+	fmt.Printf("Futures sold:       %13s\n", p.futuresNotionalSold.StringFixed(2))
+	fmt.Printf("Futures bought:     %13s\n", p.futuresNotionalBought.StringFixed(2))
+	diff := p.futuresNotionalSold.Add(p.futuresNotionalBought)
+	fmt.Printf("  Difference:       %13s\n", diff.StringFixed(2))
+	if !notionalOpen.Equal(decimal.Zero) {
+		fmt.Printf("  Open:             %13s\n", notionalOpen.StringFixed(2))
+		fmt.Printf("  Net:              %13s\n", diff.Sub(notionalOpen).StringFixed(2))
+	}
 }
 
 func (p *portfolio) PrintPL() {

@@ -1,5 +1,24 @@
 # tastypl
 
+## Getting started
+
+Prerequisites: Git (https://git-scm.com/), Go (https://golang.org/)
+
+1. Clone the repository:
+```
+git clone https://github.com/Graeme22/tastypl.git
+```
+2. Install the dependencies:
+```
+go get github.com/Graeme22/go-chart
+go get github.com/golang/glog
+go get github.com/shopspring/decimal
+```
+3. Run the code on your CSV file (instructions on how to obtain below.)
+```
+go run tastypl.go -input yourcsvfile.csv -printpl -positions -chart
+```
+
 ## Description
 
 tastypl is a [Go](https://golang.org/) program that imports your
@@ -7,19 +26,21 @@ tastypl is a [Go](https://golang.org/) program that imports your
 statistics to help you track your performance and positions.  The main
 motivation behind it was to track the net credit after rolls.
 
-## Demo
+## Obtaining CSV file
 
 On the tastyworks desktop app, go to the History tab, and under "transactions"
 pick a start date that is before the creation of your account, then click the
 CSV button to export all the transactions to a file.  You need _all_ the
 transactions in the CSV file otherwise the numbers won't make sense.
+Note: Do NOT choose YTD, it outputs a completely different CSV! Use a custom date range.
+
+## Demonstration
 
 Here is a simple example for a portfolio with an AAPL straddle, a BIDU
 position that has received an assignment, and a ROKU position that has
 been rolled.
 
 ```
-$ go run tastypl.go -input demo.csv -printpl -positions
 ----- Overall statistics ----
 Number of transactions:    46    (in 97 days => 0.5/day avg)
 Realized P&L:            2246.00
@@ -50,7 +71,7 @@ ROKU  (1 position) [RPL=122.00]
   Feb 16 short 1 $44 put  @ 4.78 [BEP=38.00]  (net credit 6.00)
 ```
 
-The `-chart` option will generate a graph in `rpl.png` that looks like this:
+The `-chart` option generated a graph in a file called `rpl.png` that looks like this:
 
 ![Realized P/L over time](https://raw.githubusercontent.com/gotasty/tastypl/master/sample/rpl.png)
 

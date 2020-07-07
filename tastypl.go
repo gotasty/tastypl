@@ -27,8 +27,8 @@ import (
 
 	"github.com/golang/glog"
 	"github.com/shopspring/decimal"
-	chart "github.com/wcharczuk/go-chart"
-	"github.com/wcharczuk/go-chart/util"
+	chart "github.com/Graeme22/go-chart"
+	"github.com/Graeme22/go-chart/util"
 )
 
 type transaction struct {

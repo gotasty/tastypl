@@ -18,6 +18,7 @@ go get github.com/shopspring/decimal
 ```
 go run tastypl.go -input yourcsvfile.csv -printpl -positions -chart
 ```
+Note: On OSX, the full path to the CSV file must be specified.
 
 ## Description
 
@@ -33,6 +34,12 @@ pick a start date that is before the creation of your account, then click the
 CSV button to export all the transactions to a file.  You need _all_ the
 transactions in the CSV file otherwise the numbers won't make sense.
 Note: Do NOT choose YTD, it outputs a completely different CSV! Use a custom date range.
+Also, make sure to scroll to the bottom of the transaction list in TastyWorks before exporting--it has a glitch and will not export the full history otherwise.
+Finally, sometimes stocks will go through splits, reverse splits, or other rare events that tend to not play nicely with this script. If that happens, you might see an error like:
+```
+expected symbol "USO   201016C00005500" but found "USO1  201016C00005500"
+```
+In this case, you'll need to edit your CSV file. Open it in something other than Excel (which has a tendency to screw up the formatting), then replace all instances of the number after the symbol with a space (so in this case 'USO1' would become 'USO ').
 
 ## Demonstration
 

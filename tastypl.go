@@ -137,6 +137,10 @@ var (
 		"/6J":  decimal.RequireFromString("125000000"),
 		// Crypto
 		"/BTC": decimal.RequireFromString("5"),
+		// Small exchange
+		"/SPRE": decimal.RequireFromString("1"),
+		"/SM75": decimal.RequireFromString("1"),
+		"/SFX": decimal.RequireFromString("1"),
 	}
 )
 

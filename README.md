@@ -10,6 +10,7 @@ git clone https://github.com/Graeme22/tastypl.git
 ```
 2. Install the dependencies:
 ```
+go env -w GO111MODULE=off
 go get github.com/Graeme22/go-chart
 go get github.com/golang/glog
 go get github.com/shopspring/decimal

@@ -40,7 +40,10 @@ Finally, sometimes stocks will go through splits, reverse splits, or other rare 
 ```
 expected symbol "USO   201016C00005500" but found "USO1  201016C00005500"
 ```
-In this case, you'll need to edit your CSV file. Open it in something other than Excel (which has a tendency to screw up the formatting), then replace all instances of the number after the symbol with a space (so in this case 'USO1' would become 'USO ').
+In this case, you'll need to edit your CSV file. Open it in something other than Excel (which has a tendency to screw up the formatting), then replace all 
+instances of the number after the symbol with a space (so in this case 'USO1' would become 'USO ').
+
+You may also see an error regarding the parsing of `--`. If that is the case, replace all instances of `--` with `0`.
 
 ## Demonstration
 

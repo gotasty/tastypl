@@ -1,5 +1,10 @@
 # tastypl
 
+## NOTICE: No longer supported
+
+Due to a host of issues and a pretty ugly implementation to begin with, it is no longer feasible for me to maintain this project.
+However, don't panic! I'm working on a new implementation in Python that should make everyone's lives much easier. Stay tuned!
+
 ## Getting started
 
 Prerequisites: Git (https://git-scm.com/), Go (https://golang.org/)

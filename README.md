@@ -3,7 +3,8 @@
 ## NOTICE: No longer supported
 
 Due to a host of issues and a pretty ugly implementation to begin with, it is no longer feasible for me to maintain this project.
-However, don't panic! I'm working on a new implementation in Python that should make everyone's lives much easier. Stay tuned!
+However, don't panic! I'm working on a new implementation in Python that should make everyone's lives much easier. I expect the first release soon!
+http://github.com/Graeme22/tastyworks-cli
 
 ## Getting started
 

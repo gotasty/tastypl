@@ -27,8 +27,8 @@ import (
 
 	"github.com/golang/glog"
 	"github.com/shopspring/decimal"
-	chart "github.com/wcharczuk/go-chart"
-	"github.com/wcharczuk/go-chart/util"
+	chart "github.com/Graeme22/go-chart"
+	"github.com/Graeme22/go-chart/util"
 )
 
 type transaction struct {
@@ -137,6 +137,10 @@ var (
 		"/6J":  decimal.RequireFromString("125000000"),
 		// Crypto
 		"/BTC": decimal.RequireFromString("5"),
+		// Small exchange
+		"/SPRE": decimal.RequireFromString("1"),
+		"/SM75": decimal.RequireFromString("1"),
+		"/SFX": decimal.RequireFromString("1"),
 	}
 )
 
